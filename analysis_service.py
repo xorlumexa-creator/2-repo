@@ -711,16 +711,57 @@ def _repair_mesh_for_meshing(mesh):
     failing just means Gmsh sees the original mesh and may reject it as before,
     not that the whole request fails.
     """
+    # FIX: this used to be one try/except around all four steps — the moment ANY
+    # single call raised (e.g. mesh.remove_duplicate_faces(), which newer trimesh
+    # releases dropped in favor of update_faces(unique_faces())), the whole repair
+    # aborted and every later step was silently skipped too. Confirmed live: a
+    # Termux test against an unpinned `trimesh` (requirements.txt has no version
+    # pin, so a routine rebuild can pick up a newer release at any time) hit
+    # exactly this — "'Trimesh' object has no attribute 'remove_duplicate_faces'"
+    # — and the mesh went to Gmsh completely unrepaired. Each step now tries the
+    # modern API first, falls back to the legacy method name if that's what's
+    # actually installed, and if neither exists just skips that ONE step and
+    # says so, instead of taking the other three down with it.
+    before = len(mesh.faces)
+    steps_applied = []
+    steps_skipped = {}
+
+    def _try_step(name, modern_fn, legacy_attr):
+        try:
+            modern_fn()
+            steps_applied.append(name)
+            return
+        except Exception:
+            pass
+        legacy = getattr(mesh, legacy_attr, None)
+        if callable(legacy):
+            try:
+                legacy()
+                steps_applied.append(f"{name} (legacy API)")
+                return
+            except Exception as e:
+                steps_skipped[name] = f"legacy API also failed: {type(e).__name__}: {e}"
+                return
+        steps_skipped[name] = "neither modern nor legacy trimesh API for this step is available"
+
     try:
-        before = len(mesh.faces)
         mesh.merge_vertices()
-        mesh.remove_duplicate_faces()
-        mesh.remove_degenerate_faces()
-        mesh.fix_normals()
-        after = len(mesh.faces)
-        return mesh, {"faces_before": before, "faces_after": after}
+        steps_applied.append("merge_vertices")
     except Exception as e:
-        return mesh, {"repair_failed": f"{type(e).__name__}: {e}"}
+        steps_skipped["merge_vertices"] = f"{type(e).__name__}: {e}"
+
+    _try_step("remove_duplicate_faces",
+               lambda: mesh.update_faces(mesh.unique_faces()), "remove_duplicate_faces")
+    _try_step("remove_degenerate_faces",
+               lambda: mesh.update_faces(mesh.nondegenerate_faces()), "remove_degenerate_faces")
+    _try_step("fix_normals",
+               lambda: trimesh.repair.fix_normals(mesh), "fix_normals")
+
+    after = len(mesh.faces)
+    info = {"faces_before": before, "faces_after": after, "steps_applied": steps_applied}
+    if steps_skipped:
+        info["steps_skipped"] = steps_skipped
+    return mesh, info
 
 @app.post("/run-fem")
 async def run_fem(
