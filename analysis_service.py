@@ -276,33 +276,13 @@ def _set_gmsh_option_safe(name, value):
         pass
 
 
-def _tetrahedralize_with_gmsh(mesh, mesh_size_factor=0.08, max_tets=80000):
-    """
-    Volume-mesh a watertight trimesh surface into linear (4-node) tetrahedra
-    using Gmsh's STL-reconstruction workflow: merge STL -> classify surfaces ->
-    reconstruct a real geometric model from the facets -> add a volume -> generate
-    a 3D mesh. This is the standard documented approach (Gmsh tutorial t13) for
-    turning an arbitrary triangulated surface into a solid mesh without a CAD
-    kernel behind it.
-
-    Returns (node_coords, tets):
-      node_coords: list of (x,y,z), index i corresponds to CalculiX node id i+1
-      tets: list of (n1,n2,n3,n4) 1-based CalculiX node ids, one tuple per element
-
-    Raises RuntimeError on any failure (non-manifold input, degenerate geometry,
-    meshing failure, mesh too large) so the caller falls back to the shell path.
-
-    IMPORTANT: this has not been executed in the development sandbox this was
-    written in — gmsh isn't installed there and it has no network to install it.
-    It follows Gmsh's documented STL-reconstruction API closely, but treat it as
-    untested until it's actually run once on a deployment where both gmsh and
-    ccx are available (this codebase already gates on that via the GMSH/CALCULIX
-    flags), and confirm the shell fallback still engages cleanly if it raises.
-    """
+def _tetrahedralize_with_gmsh_attempt(mesh, mesh_size_factor, angle_deg, max_tets):
+    """One attempt at solid tet meshing with a specific (angle, size) setting.
+    Factored out of _tetrahedralize_with_gmsh so it can be retried with more
+    conservative settings on failure instead of giving up after one shot."""
     stl_path = tempfile.NamedTemporaryFile(suffix=".stl", delete=False).name
     try:
         mesh.export(stl_path)
-
         with _GMSH_LOCK:
             gmsh.initialize()
             try:
@@ -311,7 +291,7 @@ def _tetrahedralize_with_gmsh(mesh, mesh_size_factor=0.08, max_tets=80000):
                 gmsh.model.add("lumexa_part")
                 gmsh.merge(stl_path)
 
-                angle_deg, curve_angle_deg = 40.0, 180.0
+                curve_angle_deg = 180.0
                 gmsh.model.mesh.classifySurfaces(
                     angle_deg * math.pi / 180.0,
                     True,   # includeBoundary
@@ -332,6 +312,21 @@ def _tetrahedralize_with_gmsh(mesh, mesh_size_factor=0.08, max_tets=80000):
                 # both get a sane element count instead of one fixed absolute size.
                 diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
                 target = max(diag * mesh_size_factor, 0.1)
+                # FIX: confirmed live — this used to size elements ONLY off the
+                # overall part diagonal, so a 300mm beam with a 2mm fillet got a
+                # ~7mm target element even at the fillet — far too coarse to
+                # resolve a 2mm curve, a likely contributor to the parametrization
+                # failures seen on every tapered-beam test so far. The CAD kernel
+                # already had to tessellate small curved features finely enough
+                # to look right in the STL, so the INPUT mesh's own finest edges
+                # are a much better proxy for "smallest feature that needs
+                # resolving" than the part's overall bounding-box diagonal.
+                try:
+                    edge_lengths = mesh.edges_unique_length
+                    finest = float(np.percentile(edge_lengths, 10))
+                except Exception:
+                    finest = target
+                target = min(target, max(finest * 3.0, 0.05))
                 for name in ("Mesh.MeshSizeMin", "Mesh.CharacteristicLengthMin"):
                     _set_gmsh_option_safe(name, target * 0.3)
                 for name in ("Mesh.MeshSizeMax", "Mesh.CharacteristicLengthMax"):
@@ -372,6 +367,42 @@ def _tetrahedralize_with_gmsh(mesh, mesh_size_factor=0.08, max_tets=80000):
         if os.path.exists(stl_path):
             try: os.unlink(stl_path)
             except: pass
+
+
+def _tetrahedralize_with_gmsh(mesh, mesh_size_factor=0.08, max_tets=80000):
+    """
+    Volume-mesh a watertight trimesh surface into linear (4-node) tetrahedra
+    using Gmsh's STL-reconstruction workflow: merge STL -> classify surfaces ->
+    reconstruct a real geometric model from the facets -> add a volume -> generate
+    a 3D mesh. This is the standard documented approach (Gmsh tutorial t13) for
+    turning an arbitrary triangulated surface into a solid mesh without a CAD
+    kernel behind it.
+
+    Returns (node_coords, tets):
+      node_coords: list of (x,y,z), index i corresponds to CalculiX node id i+1
+      tets: list of (n1,n2,n3,n4) 1-based CalculiX node ids, one tuple per element
+
+    Raises RuntimeError on any failure (non-manifold input, degenerate geometry,
+    meshing failure, mesh too large) so the caller falls back to the shell path.
+
+    FIX: confirmed live — the original single-shot angle_deg=40 classification
+    consistently failed with "Invalid exterior boundary mesh for parametrization"
+    on tapered-beam parts, specifically at the fillet (a continuously-curved
+    patch is much harder for Gmsh to flatten into ONE parametrizable region at a
+    permissive 40deg grouping angle than as several smaller, nearly-planar
+    patches at a tighter angle). Now tries a tighter, fillet-friendly angle
+    first and retries ONCE with a more conservative angle + finer size cap
+    before giving up to the shell fallback — bounded to 2 attempts total, not
+    open-ended, so a genuinely unmeshable part still fails fast.
+    """
+    last_err = None
+    for angle_deg, size_factor in [(18.0, mesh_size_factor), (10.0, mesh_size_factor * 0.6)]:
+        try:
+            return _tetrahedralize_with_gmsh_attempt(mesh, size_factor, angle_deg, max_tets)
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Gmsh tetrahedralization failed after 2 attempts (angles tried: 18deg, "
+                        f"10deg): {type(last_err).__name__}: {last_err}")
 
 
 def _run_calculix_solid_tet(mesh, mat_key, force_n=1000, force_dir="z"):
@@ -756,6 +787,31 @@ def _repair_mesh_for_meshing(mesh):
                lambda: mesh.update_faces(mesh.nondegenerate_faces()), "remove_degenerate_faces")
     _try_step("fix_normals",
                lambda: trimesh.repair.fix_normals(mesh), "fix_normals")
+
+    # FIX: confirmed live — Gmsh's classifySurfaces/createGeometry step ("Invalid
+    # exterior boundary mesh for parametrization") and CalculiX's shell solve
+    # ("nonpositive jacobian determinant") both failed on the SAME tapered-beam
+    # parts, on the fillet region specifically. Both symptoms are consistent
+    # with skinny/sliver triangles in the raw CAD STL tessellation around the
+    # fillet-to-flat transition — a curved patch tessellated coarsely relative
+    # to its curvature produces exactly this shape of degenerate element, and
+    # neither the duplicate/degenerate-face removal above nor Gmsh's own mesh
+    # size settings can fix a triangle that's merely thin-but-nonzero-area
+    # rather than truly degenerate. A mild Humphrey-smoothing pass (shape-
+    # preserving — much less shrinkage than plain Laplacian smoothing) relaxes
+    # vertex positions just enough to improve triangle regularity without
+    # materially distorting the part. This is a real accuracy trade-off, not a
+    # free lunch: the geometry FEA actually solves is a very slightly smoothed
+    # version of the exact CAD part, not the literal dimensions requested. That
+    # trade is made deliberately here, scoped to ONLY this FEM-meshing copy of
+    # the mesh (main.py's geometry inspection / wall-thickness / rule-engine
+    # checks all run on the original, unsmoothed mesh) — a real FEM result on a
+    # near-identical shape beats no FEM result at all on the exact one.
+    try:
+        trimesh.smoothing.filter_humphrey(mesh, alpha=0.1, beta=0.5, iterations=3)
+        steps_applied.append("filter_humphrey_smoothing")
+    except Exception as e:
+        steps_skipped["filter_humphrey_smoothing"] = f"{type(e).__name__}: {e}"
 
     after = len(mesh.faces)
     info = {"faces_before": before, "faces_after": after, "steps_applied": steps_applied}
