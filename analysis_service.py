@@ -369,7 +369,7 @@ def _tetrahedralize_with_gmsh_attempt(mesh, mesh_size_factor, angle_deg, max_tet
             except: pass
 
 
-def _tetrahedralize_with_gmsh(mesh, mesh_size_factor=0.12, max_tets=20000):
+def _tetrahedralize_with_gmsh(mesh, mesh_size_factor=0.08, max_tets=80000):
     """
     Volume-mesh a watertight trimesh surface into linear (4-node) tetrahedra
     using Gmsh's STL-reconstruction workflow: merge STL -> classify surfaces ->
@@ -395,18 +395,12 @@ def _tetrahedralize_with_gmsh(mesh, mesh_size_factor=0.12, max_tets=20000):
     before giving up to the shell fallback — bounded to 2 attempts total, not
     open-ended, so a genuinely unmeshable part still fails fast.
 
-    Defaults tightened from (0.08, 80000) to (0.12, 20000) after a live crash
-    on Render's free tier (512MB / 0.1 CPU): a real gear-housing part climbed
-    to ~177MB and pegged CPU mid-solve, then the process died and restarted
-    with no completed response (confirmed via Render's own memory/CPU metrics
-    and the request never appearing in this service's own access logs — killed
-    mid-request, before uvicorn could log it). A coarser default target size and
-    a much lower element-count ceiling bound the worst case for any part on
-    constrained hardware; the existing len(tets) > max_tets check already falls
-    back to (much cheaper) shell FEM, so this just makes that fallback trigger
-    sooner for complex parts — trading some solid-tet fidelity for the service
-    actually staying up. Raise these back toward the old values if/when this
-    runs on a paid plan with real headroom.
+    Defaults restored to (0.08, 80000) after moving this service to Railway
+    (1GB RAM, documented 5-minute request timeout) — they were temporarily
+    tightened to (0.12, 20000) while this ran on Render's free tier (512MB,
+    an undocumented proxy timeout well under a minute) to survive a live crash
+    seen there. Railway's real headroom removes the reason for the trade-off;
+    tighten these again if this ever moves to another constrained host.
     """
     last_err = None
     for angle_deg, size_factor in [(18.0, mesh_size_factor), (10.0, mesh_size_factor * 0.6)]:
