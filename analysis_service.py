@@ -369,31 +369,139 @@ def _tetrahedralize_with_gmsh_attempt(mesh, mesh_size_factor, angle_deg, max_tet
             except: pass
 
 
+def _tetrahedralize_with_gmsh_discrete_attempt(mesh, mesh_size_factor, max_tets):
+    """Third fallback tet-meshing attempt: skip Gmsh's classifySurfaces/createGeometry
+    reparametrization step entirely and tetrahedralize directly against the STL's OWN
+    existing triangulation, treated as a fixed discrete boundary.
+
+    WHY THIS EXISTS: classifySurfaces/createGeometry (used by
+    _tetrahedralize_with_gmsh_attempt, both angle-18 and angle-10 tries) rebuilds a
+    parametrized CAD-like model from the STL so Gmsh can freely remesh each patch —
+    but that requires every classified patch to be "parametrizable" (topologically a
+    disk). Complex mechanical parts with several small fillets/bosses/bores meeting
+    at odd angles (a gear housing, for instance) routinely produce at least one patch
+    that ISN'T, and Gmsh raises "Wrong topology of boundary mesh for parametrization"
+    — regardless of angle threshold, because the problem is patch TOPOLOGY, not
+    triangle quality or classification angle. Confirmed live: both angle attempts
+    failed with this identical error on every gear-housing test this session, even
+    after the mesh became genuinely watertight — so more angle retries alone were not
+    going to fix it.
+
+    This attempt sidesteps the problem entirely: a merged STL is ALREADY a valid
+    discrete surface entity in Gmsh's model. If that surface is a closed 2-manifold
+    (already confirmed via is_watertight before this is ever reached), a Volume can
+    be built directly around the discrete surface and handed straight to 3D Delaunay
+    tetrahedralization, using the STL's own triangles as fixed boundary faces. No
+    parametrization step happens at all, so the topology requirement that's failing
+    above never applies. This is a documented alternative Gmsh meshing path for
+    exactly this failure mode — as opposed to the CAD-reconstruction path above,
+    which is meant for cases where the surface itself needs remeshing/simplifying.
+
+    NOT VERIFIED AGAINST A LIVE FAILING PART — gmsh isn't installed in the sandbox
+    this was written in (no network access to install it either), so this is built
+    from documented Gmsh discrete-entity behavior, not a live test run. Wired in as
+    an ADDITIONAL third attempt, only reached after both existing classify-based
+    attempts already fail — it cannot regress a part that currently succeeds.
+    """
+    stl_path = tempfile.NamedTemporaryFile(suffix=".stl", delete=False).name
+    try:
+        mesh.export(stl_path)
+        with _GMSH_LOCK:
+            gmsh.initialize()
+            try:
+                _set_gmsh_option_safe("General.Terminal", 0)
+                _set_gmsh_option_safe("General.Verbosity", 0)
+                gmsh.model.add("lumexa_part_discrete")
+                gmsh.merge(stl_path)
+
+                surfaces = gmsh.model.getEntities(2)
+                if not surfaces:
+                    raise RuntimeError("Gmsh found no surface entities after merging the STL "
+                                        "(unexpected — the export itself may be empty).")
+
+                # Build the volume directly around the discrete surface(s) as-is —
+                # no classifySurfaces/createGeometry, so no parametrization is
+                # required and none of it can fail.
+                loop = gmsh.model.geo.addSurfaceLoop([s[1] for s in surfaces])
+                gmsh.model.geo.addVolume([loop])
+                gmsh.model.geo.synchronize()
+
+                diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+                target = max(diag * mesh_size_factor, 0.1)
+                try:
+                    edge_lengths = mesh.edges_unique_length
+                    finest = float(np.percentile(edge_lengths, 10))
+                except Exception:
+                    finest = target
+                target = min(target, max(finest * 3.0, 0.05))
+                for name in ("Mesh.MeshSizeMin", "Mesh.CharacteristicLengthMin"):
+                    _set_gmsh_option_safe(name, target * 0.3)
+                for name in ("Mesh.MeshSizeMax", "Mesh.CharacteristicLengthMax"):
+                    _set_gmsh_option_safe(name, target)
+                # The boundary is already meshed (discrete, straight from the STL) —
+                # don't let Gmsh try to re-extend/re-size it; only fill the interior.
+                _set_gmsh_option_safe("Mesh.MeshSizeExtendFromBoundary", 0)
+
+                gmsh.model.mesh.generate(3)
+
+                node_tags, node_coords_flat, _ = gmsh.model.mesh.getNodes()
+                if len(node_tags) == 0:
+                    raise RuntimeError("Gmsh produced zero nodes for this part (discrete path).")
+
+                tag_to_idx = {int(t): i for i, t in enumerate(node_tags)}
+                coords = np.asarray(node_coords_flat, dtype=float).reshape(-1, 3)
+
+                elem_types, _elem_tags, elem_node_tags = gmsh.model.mesh.getElements(dim=3)
+                tets = []
+                for etype, enodes in zip(elem_types, elem_node_tags):
+                    if etype != 4:  # 4 = linear 4-node tetrahedron in Gmsh's element numbering
+                        continue
+                    flat = np.asarray(enodes, dtype=int)
+                    for k in range(0, len(flat), 4):
+                        n1, n2, n3, n4 = flat[k:k+4]
+                        tets.append((
+                            tag_to_idx[int(n1)] + 1, tag_to_idx[int(n2)] + 1,
+                            tag_to_idx[int(n3)] + 1, tag_to_idx[int(n4)] + 1,
+                        ))
+
+                if not tets:
+                    raise RuntimeError("Gmsh generated zero tetrahedral (C3D4) elements (discrete path).")
+                if len(tets) > max_tets:
+                    raise RuntimeError(f"Tet mesh too large ({len(tets)} elements > {max_tets} cap) "
+                                        f"for a timely solve (discrete path); falling back to shell FEM.")
+
+                return [tuple(c) for c in coords], tets
+            finally:
+                gmsh.finalize()
+    finally:
+        if os.path.exists(stl_path):
+            try: os.unlink(stl_path)
+            except: pass
+
+
 def _tetrahedralize_with_gmsh(mesh, mesh_size_factor=0.08, max_tets=80000):
     """
-    Volume-mesh a watertight trimesh surface into linear (4-node) tetrahedra
-    using Gmsh's STL-reconstruction workflow: merge STL -> classify surfaces ->
-    reconstruct a real geometric model from the facets -> add a volume -> generate
-    a 3D mesh. This is the standard documented approach (Gmsh tutorial t13) for
-    turning an arbitrary triangulated surface into a solid mesh without a CAD
-    kernel behind it.
+    Volume-mesh a watertight trimesh surface into linear (4-node) tetrahedra.
+    Tries THREE attempts in order before giving up to the shell fallback:
+      1-2. Gmsh's STL-reconstruction workflow (Gmsh tutorial t13): merge STL ->
+           classify surfaces -> reconstruct a parametrized geometric model from the
+           facets -> add a volume -> generate a 3D mesh. Tried once at a tighter,
+           fillet-friendly angle (18deg) and once more conservatively (10deg, finer
+           size cap) if the first fails.
+      3.   Discrete-direct meshing (_tetrahedralize_with_gmsh_discrete_attempt):
+           skips reparametrization entirely and tetrahedralizes straight against the
+           STL's existing triangulation. Added because attempts 1-2 share the same
+           failure mode on complex fillet/boss-heavy parts (a patch that classifies
+           fine at neither angle because the problem is patch TOPOLOGY, not angle or
+           triangle quality) — confirmed live, identically, on every gear-housing
+           test this session. See that function's docstring for the full reasoning.
 
     Returns (node_coords, tets):
       node_coords: list of (x,y,z), index i corresponds to CalculiX node id i+1
       tets: list of (n1,n2,n3,n4) 1-based CalculiX node ids, one tuple per element
 
-    Raises RuntimeError on any failure (non-manifold input, degenerate geometry,
-    meshing failure, mesh too large) so the caller falls back to the shell path.
-
-    FIX: confirmed live — the original single-shot angle_deg=40 classification
-    consistently failed with "Invalid exterior boundary mesh for parametrization"
-    on tapered-beam parts, specifically at the fillet (a continuously-curved
-    patch is much harder for Gmsh to flatten into ONE parametrizable region at a
-    permissive 40deg grouping angle than as several smaller, nearly-planar
-    patches at a tighter angle). Now tries a tighter, fillet-friendly angle
-    first and retries ONCE with a more conservative angle + finer size cap
-    before giving up to the shell fallback — bounded to 2 attempts total, not
-    open-ended, so a genuinely unmeshable part still fails fast.
+    Raises RuntimeError only if all three attempts fail, so the caller falls back
+    to the shell path.
 
     Defaults restored to (0.08, 80000) after moving this service to Railway
     (1GB RAM, documented 5-minute request timeout) — they were temporarily
@@ -408,8 +516,12 @@ def _tetrahedralize_with_gmsh(mesh, mesh_size_factor=0.08, max_tets=80000):
             return _tetrahedralize_with_gmsh_attempt(mesh, size_factor, angle_deg, max_tets)
         except Exception as e:
             last_err = e
-    raise RuntimeError(f"Gmsh tetrahedralization failed after 2 attempts (angles tried: 18deg, "
-                        f"10deg): {type(last_err).__name__}: {last_err}")
+    try:
+        return _tetrahedralize_with_gmsh_discrete_attempt(mesh, mesh_size_factor, max_tets)
+    except Exception as e:
+        last_err = e
+    raise RuntimeError(f"Gmsh tetrahedralization failed after 3 attempts (angles 18deg, 10deg, "
+                        f"then discrete-direct): {type(last_err).__name__}: {last_err}")
 
 
 def _run_calculix_solid_tet(mesh, mat_key, force_n=1000, force_dir="z"):
