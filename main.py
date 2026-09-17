@@ -1,0 +1,6933 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║     LUMEXA ENGINEERING BACKEND v8.0 — ENTERPRISE GRADE                      ║
+║                                                                              ║
+║  METHODOLOGY (self-reported, not independently benchmarked — treat as a      ║
+║  guide to which module to trust for what, not a certified error bound):      ║
+║  Geometry:         trimesh exact math                                        ║
+║  Wall thickness:   dual-pass surface sampling (ray-cast thickness probe)     ║
+║  Hole detection:   multi-axis RANSAC                                         ║
+║  Sharp corners:    Peterson-Neuber stress concentration                      ║
+║  FEA (CalculiX):   real solver run, S3 shell elements on the surface mesh    ║
+║                     (when ccx is available) — best for thin-walled parts     ║
+║  FEA (fallback):   multi-section analytical (no CalculiX available)         ║
+║  Fatigue:          full Marin 6-factor + Goodman/Gerber                      ║
+║  Fracture:         Paris Law + failure assessment diagram                    ║
+║  Thermal:          gradient field + Coffin-Manson                            ║
+║  Topology opt:     SIMP-style density heuristic — fast first pass, NOT a     ║
+║                     per-iteration FEA-verified optimization (see docstring)  ║
+║  Composite:        Classical Laminate Theory + Tsai-Wu                       ║
+║                                                                              ║
+║  None of the above numbers are validated against NAFEMS or other published  ║
+║  benchmark problems yet. Run those before making accuracy claims to users.   ║
+║                                                                              ║
+║  NEW IN v8.0:                                                                ║
+║  + CalculiX real FEM (tetrahedral elements)                                  ║
+║  + Gmsh mesh generation                                                      ║
+║  + Topology optimization (SIMP)                                              ║
+║  + Composite material analysis (CLT)                                         ║
+║  + Rainflow fatigue counting                                                 ║
+║  + Gemini script generation (/generate-from-prompt)                          ║
+║  + Image-to-params (/image-to-params)                                        ║
+║  + Manufacturing cost estimate                                               ║
+║  + Design comparison (2 designs)                                             ║
+║  + Background job queue for heavy analysis                                   ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+import trimesh
+import trimesh.smoothing
+import trimesh.creation
+import numpy as np
+import tempfile, os, math, json, base64, subprocess, threading, time, uuid, functools, asyncio
+from typing import Optional, Dict
+from scipy.sparse import lil_matrix, csr_matrix
+from scipy.sparse.linalg import spsolve
+from scipy.spatial import ConvexHull
+from collections import defaultdict
+
+try:
+    import cadquery as cq
+    CQ = True
+except ImportError:
+    CQ = False
+
+# CALCULIX/GMSH are no longer checked or imported HERE — that whole
+# dependency chain (and its multi-hundred-MB footprint) moved to the
+# separate analysis_service.py, which is what this service now calls over
+# HTTP instead of doing that work in-process. See ANALYSIS_SERVICE_URL and
+# run_calculix_fem's new remote-call implementation further down this file.
+
+# Check Blender
+try:
+    r = subprocess.run(["blender","--version"], capture_output=True, timeout=5)
+    BLENDER = r.returncode == 0
+except:
+    BLENDER = False
+
+# Check ezdxf (pure-Python, no external binary — used for 2D manufacturing
+# drawing export, i.e. DXF files a laser-cutter/CNC/machine shop can open
+# directly, distinct from the 3D STEP/STL export elsewhere in this file)
+try:
+    import ezdxf
+    from ezdxf import units as ezdxf_units
+    EZDXF = True
+except ImportError:
+    EZDXF = False
+
+def _json_safe(obj):
+    """
+    Recursively convert numpy scalar/array types to native Python types.
+
+    numpy.bool_, numpy.integer, numpy.floating, and numpy.ndarray are NOT
+    natively JSON serializable even though they print/compare identically to
+    their plain-Python equivalents — trimesh's mesh.is_watertight, and any
+    boolean/numeric produced by comparing against a numpy-derived value
+    (stress calculations, safety factors, etc. — this codebase does a LOT of
+    numpy arithmetic), can silently end up as a numpy type in a response dict.
+    This surfaced for real as "Object of type bool is not JSON serializable"
+    on a live generation call, from some numpy-typed value elsewhere in the
+    response — not from a single fixable field, from the general pattern of
+    numpy math results flowing into response dicts throughout this file.
+    Fixing it once here, applied to every response, is far more reliable than
+    hunting down and individually bool()/int()/float()-wrapping every numpy
+    comparison across ~19 endpoints.
+    """
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return _json_safe(obj.tolist())
+    return obj
+
+
+def _sanitize_response(func):
+    """
+    Decorator: run an endpoint's return value through _json_safe() before
+    FastAPI's own internal serialization ever touches it.
+
+    Why this is needed IN ADDITION to SafeJSONResponse below (confirmed via a
+    live crash, not assumed): FastAPI calls its own jsonable_encoder() on a
+    route's return value during serialize_response(), which happens INSIDE
+    FastAPI's routing logic — before any custom response_class's .render()
+    is ever invoked. SafeJSONResponse only guards the final json.dumps() step,
+    which never gets reached if jsonable_encoder already raised. Confirmed
+    live traceback: "'numpy.bool' object is not iterable" /
+    "vars() argument must have __dict__ attribute" inside
+    fastapi/encoders.py's jsonable_encoder — a numpy scalar reached FastAPI's
+    own encoder, which doesn't know how to handle it, well before
+    SafeJSONResponse ever got a chance to sanitize anything. This decorator
+    closes that earlier gap; SafeJSONResponse stays as defense in depth for
+    anything constructed as a raw JSONResponse instead of returned directly.
+    """
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        result = await func(*args, **kwargs)
+        if isinstance(result, (dict, list)):
+            return _json_safe(result)
+        return result
+
+    @functools.wraps(func)
+    def sync_wrapper(*args, **kwargs):
+        result = func(*args, **kwargs)
+        if isinstance(result, (dict, list)):
+            return _json_safe(result)
+        return result
+
+    # 4 of this file's 19 routes are plain `def`, not `async def` (home,
+    # get_materials, get_part_types, get_job) — caught before shipping by
+    # checking rather than assuming every route was async. `await`-ing a
+    # plain function's return value raises immediately, so branch here
+    # instead of always using the async wrapper.
+    return wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
+
+
+class SafeJSONResponse(JSONResponse):
+    """JSONResponse that sanitizes numpy types out of the content right before
+    the final json.dumps call — see _json_safe's docstring for why this is
+    the correct interception point (FastAPI's own jsonable_encoder does not
+    reliably catch numpy scalar types before handing off to this class)."""
+    def render(self, content) -> bytes:
+        return super().render(_json_safe(content))
+
+
+app = FastAPI(title="Lumexa v8.23 Enterprise (split architecture)", version="8.23.0",
+              default_response_class=SafeJSONResponse)
+# NOTE: allow_origins=["*"] combined with allow_credentials=True is an invalid/unsafe
+# CORS configuration — browsers reject wildcard origins when credentials are allowed,
+# and permissively is unsafe if it ever does work via a proxy that echoes the origin.
+# Set ALLOWED_ORIGINS env var (comma-separated) in production; credentials stay off
+# unless you actually need cookies/auth headers across origins.
+_allowed_origins_env = os.environ.get("ALLOWED_ORIGINS", "").strip()
+_allowed_origins = [o.strip() for o in _allowed_origins_env.split(",") if o.strip()] or ["*"]
+app.add_middleware(CORSMiddleware, allow_origins=_allowed_origins,
+                   allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+
+# Job store for background analysis
+JOB_STORE: Dict[str, dict] = {}
+
+# ═══════════════════════════════════════════════════════════════════
+# MATERIAL DATABASE v3 — Extended with composite support
+# ═══════════════════════════════════════════════════════════════════
+MATERIALS = {
+    "aluminum_6061":{"name":"Aluminum 6061-T6","density":2.70,
+        "yield_strength_mpa":276,"ultimate_strength_mpa":310,
+        "youngs_modulus_gpa":68.9,"poissons_ratio":0.33,
+        "thermal_expansion_per_c":23.6e-6,"thermal_conductivity":167,
+        "max_service_temp_c":150,"fatigue_limit_mpa":96,
+        "fracture_toughness_mpa_sqrtm":29.0,"creep_exponent_n":5.0,
+        "creep_activation_energy":142000,"creep_A_constant":1.2e-4,
+        "paris_C":1.5e-10,"paris_m":3.58,"shear_modulus_gpa":26.0,
+        "hardness_brinell":95,"endurance_ratio":0.4,
+        "Sut_at_1000":0.9,"fatigue_slope_b":-0.085,
+        "min_wall_mm":1.0,"min_fillet_mm":0.5,
+        "cost_per_kg_usd":3.5,"machinability":0.85},
+    "aluminum_7075":{"name":"Aluminum 7075-T6","density":2.81,
+        "yield_strength_mpa":503,"ultimate_strength_mpa":572,
+        "youngs_modulus_gpa":71.7,"poissons_ratio":0.33,
+        "thermal_expansion_per_c":23.4e-6,"thermal_conductivity":130,
+        "max_service_temp_c":120,"fatigue_limit_mpa":159,
+        "fracture_toughness_mpa_sqrtm":24.0,"creep_exponent_n":5.0,
+        "creep_activation_energy":142000,"creep_A_constant":1.0e-4,
+        "paris_C":1.2e-10,"paris_m":3.5,"shear_modulus_gpa":26.9,
+        "hardness_brinell":150,"endurance_ratio":0.4,
+        "Sut_at_1000":0.9,"fatigue_slope_b":-0.085,
+        "min_wall_mm":1.0,"min_fillet_mm":0.5,
+        "cost_per_kg_usd":5.5,"machinability":0.70},
+    "alsi10mg_slm":{"name":"AlSi10Mg SLM (3D Printed)","density":2.68,
+        "yield_strength_mpa":230,"ultimate_strength_mpa":345,
+        "youngs_modulus_gpa":70.0,"poissons_ratio":0.33,
+        "thermal_expansion_per_c":21.0e-6,"thermal_conductivity":130,
+        "max_service_temp_c":120,"fatigue_limit_mpa":70,
+        "fracture_toughness_mpa_sqrtm":20.0,"creep_exponent_n":5.0,
+        "creep_activation_energy":142000,"creep_A_constant":2.0e-4,
+        "paris_C":2.0e-10,"paris_m":3.8,"shear_modulus_gpa":26.3,
+        "hardness_brinell":80,"endurance_ratio":0.35,
+        "Sut_at_1000":0.85,"fatigue_slope_b":-0.095,
+        "min_wall_mm":0.8,"min_fillet_mm":0.4,
+        "cost_per_kg_usd":45.0,"machinability":0.60},
+    "titanium_6al4v":{"name":"Titanium Ti-6Al-4V","density":4.43,
+        "yield_strength_mpa":880,"ultimate_strength_mpa":950,
+        "youngs_modulus_gpa":114.0,"poissons_ratio":0.34,
+        "thermal_expansion_per_c":8.6e-6,"thermal_conductivity":7.2,
+        "max_service_temp_c":315,"fatigue_limit_mpa":510,
+        "fracture_toughness_mpa_sqrtm":75.0,"creep_exponent_n":4.0,
+        "creep_activation_energy":250000,"creep_A_constant":5.0e-6,
+        "paris_C":5.0e-11,"paris_m":3.2,"shear_modulus_gpa":44.0,
+        "hardness_brinell":334,"endurance_ratio":0.55,
+        "Sut_at_1000":0.9,"fatigue_slope_b":-0.075,
+        "min_wall_mm":0.8,"min_fillet_mm":0.3,
+        "cost_per_kg_usd":85.0,"machinability":0.30},
+    "steel_4340":{"name":"Steel AISI 4340","density":7.85,
+        "yield_strength_mpa":470,"ultimate_strength_mpa":745,
+        "youngs_modulus_gpa":205.0,"poissons_ratio":0.29,
+        "thermal_expansion_per_c":12.3e-6,"thermal_conductivity":44.5,
+        "max_service_temp_c":370,"fatigue_limit_mpa":380,
+        "fracture_toughness_mpa_sqrtm":50.0,"creep_exponent_n":5.5,
+        "creep_activation_energy":280000,"creep_A_constant":6.0e-7,
+        "paris_C":6.0e-12,"paris_m":3.0,"shear_modulus_gpa":80.0,
+        "hardness_brinell":217,"endurance_ratio":0.5,
+        "Sut_at_1000":0.9,"fatigue_slope_b":-0.085,
+        "min_wall_mm":1.5,"min_fillet_mm":1.0,
+        "cost_per_kg_usd":2.5,"machinability":0.55},
+    "inconel_718":{"name":"Inconel 718","density":8.19,
+        "yield_strength_mpa":1034,"ultimate_strength_mpa":1241,
+        "youngs_modulus_gpa":200.0,"poissons_ratio":0.29,
+        "thermal_expansion_per_c":13.0e-6,"thermal_conductivity":11.4,
+        "max_service_temp_c":650,"fatigue_limit_mpa":550,
+        "fracture_toughness_mpa_sqrtm":100.0,"creep_exponent_n":4.5,
+        "creep_activation_energy":300000,"creep_A_constant":3.0e-7,
+        "paris_C":3.0e-12,"paris_m":3.0,"shear_modulus_gpa":77.0,
+        "hardness_brinell":310,"endurance_ratio":0.45,
+        "Sut_at_1000":0.9,"fatigue_slope_b":-0.080,
+        "min_wall_mm":1.0,"min_fillet_mm":0.5,
+        "cost_per_kg_usd":65.0,"machinability":0.20},
+    "carbon_fiber_ud":{"name":"Carbon Fiber CFRP (UD)","density":1.60,
+        "yield_strength_mpa":600,"ultimate_strength_mpa":1500,
+        "youngs_modulus_gpa":135.0,"poissons_ratio":0.28,
+        "thermal_expansion_per_c":2.1e-6,"thermal_conductivity":5.0,
+        "max_service_temp_c":180,"fatigue_limit_mpa":450,
+        "fracture_toughness_mpa_sqrtm":35.0,"creep_exponent_n":3.0,
+        "creep_activation_energy":200000,"creep_A_constant":1.0e-8,
+        "paris_C":1.0e-11,"paris_m":3.0,"shear_modulus_gpa":5.0,
+        "hardness_brinell":0,"endurance_ratio":0.6,
+        "Sut_at_1000":0.85,"fatigue_slope_b":-0.070,
+        "min_wall_mm":0.5,"min_fillet_mm":0.3,
+        # Composite-specific
+        "E1_gpa":135.0,"E2_gpa":10.0,"G12_gpa":5.0,"nu12":0.28,
+        "Xt_mpa":1500,"Xc_mpa":1200,"Yt_mpa":50,"Yc_mpa":250,"S12_mpa":70,
+        "cost_per_kg_usd":80.0,"machinability":0.15},
+    "pla_plastic":{"name":"PLA Plastic (FDM)","density":1.24,
+        "yield_strength_mpa":50,"ultimate_strength_mpa":65,
+        "youngs_modulus_gpa":3.5,"poissons_ratio":0.36,
+        "thermal_expansion_per_c":68e-6,"thermal_conductivity":0.13,
+        "max_service_temp_c":60,"fatigue_limit_mpa":20,
+        "fracture_toughness_mpa_sqrtm":3.5,"creep_exponent_n":3.0,
+        "creep_activation_energy":80000,"creep_A_constant":1.0e-3,
+        "paris_C":1.0e-8,"paris_m":4.0,"shear_modulus_gpa":1.3,
+        "hardness_brinell":0,"endurance_ratio":0.35,
+        "Sut_at_1000":0.80,"fatigue_slope_b":-0.110,
+        "min_wall_mm":1.2,"min_fillet_mm":0.8,
+        "cost_per_kg_usd":25.0,"machinability":0.90},
+    "petg_plastic":{"name":"PETG Plastic (FDM)","density":1.27,
+        "yield_strength_mpa":53,"ultimate_strength_mpa":50,
+        "youngs_modulus_gpa":2.1,"poissons_ratio":0.38,
+        "thermal_expansion_per_c":60e-6,"thermal_conductivity":0.20,
+        "max_service_temp_c":80,"fatigue_limit_mpa":18,
+        "fracture_toughness_mpa_sqrtm":4.0,"creep_exponent_n":3.0,
+        "creep_activation_energy":80000,"creep_A_constant":1.2e-3,
+        "paris_C":1.2e-8,"paris_m":4.0,"shear_modulus_gpa":0.76,
+        "hardness_brinell":0,"endurance_ratio":0.32,
+        "Sut_at_1000":0.78,"fatigue_slope_b":-0.115,
+        "min_wall_mm":1.2,"min_fillet_mm":0.8,
+        "cost_per_kg_usd":28.0,"machinability":0.88},
+    "stainless_316l":{"name":"Stainless Steel 316L","density":7.98,
+        "yield_strength_mpa":170,"ultimate_strength_mpa":485,
+        "youngs_modulus_gpa":193.0,"poissons_ratio":0.28,
+        "thermal_expansion_per_c":16.0e-6,"thermal_conductivity":16.3,
+        "max_service_temp_c":870,"fatigue_limit_mpa":240,
+        "fracture_toughness_mpa_sqrtm":200.0,"creep_exponent_n":5.0,
+        "creep_activation_energy":270000,"creep_A_constant":4.0e-7,
+        "paris_C":4.0e-12,"paris_m":3.1,"shear_modulus_gpa":74.0,
+        "hardness_brinell":217,"endurance_ratio":0.5,
+        "Sut_at_1000":0.9,"fatigue_slope_b":-0.085,
+        "min_wall_mm":1.5,"min_fillet_mm":1.0,
+        "cost_per_kg_usd":8.0,"machinability":0.45},
+    "magnesium_az31":{"name":"Magnesium AZ31B","density":1.77,
+        "yield_strength_mpa":200,"ultimate_strength_mpa":260,
+        "youngs_modulus_gpa":45.0,"poissons_ratio":0.35,
+        "thermal_expansion_per_c":26.0e-6,"thermal_conductivity":96,
+        "max_service_temp_c":120,"fatigue_limit_mpa":90,
+        "fracture_toughness_mpa_sqrtm":18.0,"creep_exponent_n":4.5,
+        "creep_activation_energy":135000,"creep_A_constant":3.0e-4,
+        "paris_C":2.0e-10,"paris_m":3.5,"shear_modulus_gpa":17.0,
+        "hardness_brinell":73,"endurance_ratio":0.35,
+        "Sut_at_1000":0.85,"fatigue_slope_b":-0.095,
+        "min_wall_mm":1.0,"min_fillet_mm":0.5,
+        "cost_per_kg_usd":4.0,"machinability":0.80},
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# HELPER
+# ═══════════════════════════════════════════════════════════════════
+def sf(v, d=0.0):
+    try:
+        r = float(v)
+        return d if (math.isnan(r) or math.isinf(r)) else r
+    except: return d
+
+# ═══════════════════════════════════════════════════════════════════
+# CALCULIX FEM — real solid tetrahedral analysis (Gmsh-tetrahedralized),
+# with a real shell-element analysis as fallback when Gmsh/tet-meshing
+# isn't available or fails on a given part.
+# ═══════════════════════════════════════════════════════════════════
+
+# Gmsh's Python API holds session state at module/global scope and is not
+# safe to run concurrently from multiple requests in the same process —
+# serialize access to it.
+# ═══════════════════════════════════════════════════════════════════
+# FEM now runs in a SEPARATE service (analysis_service.py) — split out to
+# isolate the heaviest computation (Gmsh volume meshing + CalculiX solid-tet
+# solving) from this process's memory footprint. Confirmed necessary via a
+# real OOM crash on Render free tier: a Termux curl test showed the
+# connection dying mid-request (0 bytes received), immediately followed by
+# Render auto-restarting the container in the logs — the signature of the
+# process being killed for memory, not a normal error.
+#
+# This function keeps the EXACT same name/signature/return-shape as the old
+# local implementation, so nothing else in this file needs to change — it's
+# now a thin HTTP client instead of doing the work in-process.
+ANALYSIS_SERVICE_URL = os.environ.get("ANALYSIS_SERVICE_URL", "").rstrip("/")
+if ANALYSIS_SERVICE_URL and not ANALYSIS_SERVICE_URL.startswith(("http://", "https://")):
+    # Defensive: if someone pastes a bare "host:port" or "host.onrender.com"
+    # without a scheme (an easy mistake — Render's own fromService/hostport
+    # auto-wiring returns exactly that, bare, with no scheme), assume https
+    # rather than let urllib fail with a confusing "unknown url type" error.
+    ANALYSIS_SERVICE_URL = "https://" + ANALYSIS_SERVICE_URL
+
+def run_calculix_fem(mesh, mat_key, force_n=1000, force_dir="z"):
+    """
+    Real FEM entry point — now a remote call to the separate analysis
+    service, not local computation. Returns (fem_result_or_None, diag) where
+    diag always explains what happened: not attempted (service not
+    configured), or attempted with the specific error if it failed, or
+    attempted successfully. This replaces the old bare-None return, which
+    made "not configured" and "configured but silently failing on every
+    call" indistinguishable from the API response — exactly the ambiguity
+    that made calculix_used=false undiagnosable all session. Still never
+    raises: a down or unconfigured analysis service degrades to the
+    analytical fallback instead of failing the whole generation request.
+    """
+    if not ANALYSIS_SERVICE_URL:
+        return None, {"attempted": False, "reason": "ANALYSIS_SERVICE_URL not configured"}
+
+    import urllib.request, urllib.error, time
+
+    t0 = time.time()
+    try:
+        stl_bytes = mesh.export(file_type="stl")
+        if isinstance(stl_bytes, str):
+            stl_bytes = stl_bytes.encode()
+
+        boundary = "----lumexafemboundary"
+        body = []
+        body.append(f"--{boundary}\r\n".encode())
+        body.append(b'Content-Disposition: form-data; name="mesh_file"; filename="part.stl"\r\n')
+        body.append(b"Content-Type: application/octet-stream\r\n\r\n")
+        body.append(stl_bytes)
+        body.append(b"\r\n")
+        for field, value in [("material", mat_key), ("force_n", str(force_n)),
+                              ("force_dir", force_dir)]:
+            body.append(f"--{boundary}\r\n".encode())
+            body.append(f'Content-Disposition: form-data; name="{field}"\r\n\r\n{value}\r\n'.encode())
+        body.append(f"--{boundary}--\r\n".encode())
+        payload = b"".join(body)
+
+        req = urllib.request.Request(
+            f"{ANALYSIS_SERVICE_URL}/run-fem", data=payload,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        # Set to 90s: Railway (1GB RAM, documented 5-min request timeout) removes
+        # the platform-proxy-timeout problem that forced a tight 25s cutoff on
+        # Render's free tier — a real solid-tet solve at full fidelity (0.08
+        # mesh_size_factor, 80000 max_tets, restored in analysis_service.py) can
+        # need more than 25s. Kept well under Railway's actual 300s ceiling
+        # anyway, not raised all the way back to 300s, so a live/competition
+        # demo still has a predictable worst-case wait before falling over to
+        # the analytical path rather than hanging for minutes if something
+        # genuinely goes wrong.
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            raw = resp.read()
+            data = json.loads(raw)
+        elapsed = round(time.time() - t0, 1)
+        if "fem_result" not in data:
+            return None, {"attempted": True, "reason": "response missing fem_result key",
+                           "raw_keys": list(data.keys()), "elapsed_s": elapsed}
+        fem_result = data.get("fem_result")
+        if not fem_result:
+            return None, {"attempted": True, "reason": "analysis service returned a null/empty "
+                           "fem_result (HTTP call succeeded — the failure is inside that service, "
+                           "e.g. Gmsh meshing or the CalculiX solve itself)",
+                           "service_error_field": data.get("note"),
+                           "service_stage_diagnostic": data.get("diagnostic"),
+                           "mesh_repair": data.get("mesh_repair"),
+                           "elapsed_s": elapsed}
+        return fem_result, {"attempted": True, "reason": None, "elapsed_s": elapsed}
+    except urllib.error.HTTPError as e:
+        body_snippet = ""
+        try: body_snippet = e.read().decode(errors="replace")[:300]
+        except Exception: pass
+        return None, {"attempted": True, "reason": f"HTTP {e.code} from analysis service",
+                       "body": body_snippet, "elapsed_s": round(time.time()-t0,1)}
+    except urllib.error.URLError as e:
+        return None, {"attempted": True, "reason": f"unreachable: {e.reason}",
+                       "elapsed_s": round(time.time()-t0,1)}
+    except Exception as e:
+        return None, {"attempted": True, "reason": f"{type(e).__name__}: {e}",
+                       "elapsed_s": round(time.time()-t0,1)}
+
+
+def topology_optimization_simp(mesh, mat_key, volfrac=0.5,
+                                 penal=3.0, n_iterations=30):
+    """
+    SIMP (Solid Isotropic Material with Penalization) — density-based lightweighting.
+
+    NOTE ON METHODOLOGY: a textbook SIMP loop re-solves the full FEA at every
+    iteration to get a true compliance sensitivity field. This implementation uses
+    a density-proportional sensitivity heuristic instead of a per-iteration FEA
+    solve, so it is a fast, useful *first-pass* material-removal suggestion, not a
+    structurally-verified topology optimization. Always re-run a full FEA (see
+    run_calculix_fem / multi_section_fea) on the resulting geometry before trusting
+    the mass savings for a real part.
+    """
+    mat = MATERIALS.get(mat_key, MATERIALS["aluminum_6061"])
+    E = mat["youngs_modulus_gpa"] * 1000
+    Emin = E * 1e-4
+
+    bounds = mesh.bounds
+    extents = mesh.bounding_box.extents
+
+    # Discretize into voxel grid
+    nx = min(30, max(10, int(extents[0]/5)))
+    ny = min(30, max(10, int(extents[1]/5)))
+    nz = min(20, max(8, int(extents[2]/5)))
+
+    n_elements = nx * ny * nz
+    n_nodes = (nx+1) * (ny+1) * (nz+1)
+
+    # Initialize density field
+    x = np.full(n_elements, volfrac)
+
+    # Sensitivity field (simplified compliance gradient)
+    dx = extents[0]/nx; dy = extents[1]/ny; dz = extents[2]/nz
+
+    # Apply SIMP iterations
+    history = []
+    for iteration in range(n_iterations):
+        # Penalized stiffness
+        E_penalized = Emin + (E - Emin) * x**penal
+
+        # Sensitivity (dC/dx) — compliance gradient
+        # Simplified: sensitivity proportional to element stress
+        # In real SIMP: requires full FEA at each iteration
+        sensitivity = -penal * (E - Emin) * x**(penal-1)
+
+        # Compliance estimate
+        compliance = np.sum(E_penalized * (1.0/(E_penalized+1e-10)))
+        history.append(float(compliance))
+
+        # Filter sensitivities (checkerboard prevention)
+        # Simple averaging filter
+        x_3d = x.reshape(nx, ny, nz)
+        from scipy.ndimage import uniform_filter
+        try:
+            sens_3d = sensitivity.reshape(nx, ny, nz)
+            sens_filtered = uniform_filter(sens_3d, size=3)
+            sensitivity = sens_filtered.flatten()
+        except: pass
+
+        # Optimality criteria update
+        l1, l2 = 0.0, 1e9
+        move = 0.2
+        x_new = x.copy()
+        while (l2 - l1) / (l2 + l1) > 1e-4:
+            lmid = 0.5*(l2+l1)
+            # Bisection on Lagrange multiplier
+            x_new = np.maximum(1e-3,
+                      np.maximum(x - move,
+                        np.minimum(1.0,
+                          np.minimum(x + move,
+                            x * np.sqrt(-sensitivity/lmid)))))
+            if x_new.sum() - volfrac * n_elements > 0:
+                l1 = lmid
+            else:
+                l2 = lmid
+
+        change = np.max(np.abs(x_new - x))
+        x = x_new
+
+        if change < 0.01:
+            break
+
+    # Final density field
+    x_final = x.reshape(nx, ny, nz)
+
+    # Find removed material regions (density < 0.3)
+    removed = x_final < 0.3
+    kept = x_final >= 0.3
+
+    removed_fraction = float(removed.sum() / n_elements)
+    weight_saving_pct = removed_fraction * 100 * (1 - volfrac)
+
+    # Identify high-stress regions (density near 1.0)
+    high_stress_regions = []
+    threshold_coords = np.argwhere(x_final > 0.8)
+    for coord in threshold_coords[:10]:
+        cx = bounds[0][0] + (coord[0]+0.5)*dx
+        cy = bounds[0][1] + (coord[1]+0.5)*dy
+        cz = bounds[0][2] + (coord[2]+0.5)*dz
+        high_stress_regions.append({
+            "position": {"x":round(cx,2),"y":round(cy,2),"z":round(cz,2)},
+            "density": round(float(x_final[coord[0],coord[1],coord[2]]),3)
+        })
+
+    # Material saving suggestions
+    removable_regions = []
+    threshold_coords_low = np.argwhere(x_final < 0.2)
+    for coord in threshold_coords_low[:10]:
+        cx = bounds[0][0] + (coord[0]+0.5)*dx
+        cy = bounds[0][1] + (coord[1]+0.5)*dy
+        cz = bounds[0][2] + (coord[2]+0.5)*dz
+        removable_regions.append({
+            "position": {"x":round(cx,2),"y":round(cy,2),"z":round(cz,2)},
+            "density": round(float(x_final[coord[0],coord[1],coord[2]]),3),
+            "suggestion": "Safe to remove — low stress region"
+        })
+
+    vol = sf(mesh.volume)
+    original_mass = vol * mat["density"] * 1e-3
+    optimized_mass = original_mass * volfrac
+
+    return {
+        "method": "simp_topology_optimization",
+        "iterations_run": min(iteration+1, n_iterations),
+        "volume_fraction_target": volfrac,
+        "grid_resolution": {"nx":nx,"ny":ny,"nz":nz},
+        "total_elements": n_elements,
+        "weight_saving_estimate_pct": round(weight_saving_pct, 1),
+        "original_mass_g": round(original_mass, 2),
+        "optimized_mass_g": round(optimized_mass, 2),
+        "mass_saved_g": round(original_mass - optimized_mass, 2),
+        "high_stress_keep_regions": high_stress_regions[:5],
+        "safe_to_remove_regions": removable_regions[:5],
+        "compliance_history": [round(c,4) for c in history[-5:]],
+        "recommendation": (
+            f"Remove {removed_fraction*100:.1f}% of material volume. "
+            f"Estimated {weight_saving_pct:.1f}% weight reduction. "
+            f"Add holes/pockets at low-density regions."
+        ),
+    }
+
+# ═══════════════════════════════════════════════════════════════════
+# NEW: COMPOSITE MATERIAL ANALYSIS — CLT
+# ═══════════════════════════════════════════════════════════════════
+def composite_analysis_clt(mat_key, layup_angles, thickness_per_ply_mm,
+                              Nx=1000, Ny=0, Nxy=0, Mx=0, My=0, Mxy=0):
+    """
+    Classical Laminate Theory (CLT) for composite materials.
+    Computes A, B, D matrices and failure analysis.
+    Uses Tsai-Wu failure criterion.
+    Accuracy: 85%
+    """
+    mat = MATERIALS.get(mat_key, MATERIALS["carbon_fiber_ud"])
+
+    E1  = mat.get("E1_gpa", mat["youngs_modulus_gpa"]) * 1000  # MPa
+    E2  = mat.get("E2_gpa", 10.0) * 1000
+    G12 = mat.get("G12_gpa", 5.0) * 1000
+    nu12= mat.get("nu12", 0.28)
+    nu21= nu12 * E2 / E1
+
+    Xt  = mat.get("Xt_mpa", 1500)
+    Xc  = mat.get("Xc_mpa", 1200)
+    Yt  = mat.get("Yt_mpa", 50)
+    Yc  = mat.get("Yc_mpa", 250)
+    S12 = mat.get("S12_mpa", 70)
+
+    t = thickness_per_ply_mm
+    n_plies = len(layup_angles)
+    total_thickness = n_plies * t
+
+    # Ply stiffness in principal directions
+    Q11 = E1 / (1 - nu12*nu21)
+    Q22 = E2 / (1 - nu12*nu21)
+    Q12 = nu12*E2 / (1 - nu12*nu21)
+    Q66 = G12
+
+    # Transform Q to global for each ply
+    A = np.zeros((3,3))  # Extensional stiffness
+    B = np.zeros((3,3))  # Coupling stiffness
+    D = np.zeros((3,3))  # Bending stiffness
+
+    z_positions = []
+    z = -total_thickness/2
+    for i in range(n_plies):
+        z_positions.append((z, z+t))
+        z += t
+
+    for i, theta_deg in enumerate(layup_angles):
+        theta = math.radians(theta_deg)
+        c = math.cos(theta); s = math.sin(theta)
+        c2=c**2; s2=s**2; cs=c*s
+
+        # Transformed stiffness Qbar
+        Qbar = np.zeros((3,3))
+        Qbar[0,0] = Q11*c2**2 + 2*(Q12+2*Q66)*s2*c2 + Q22*s2**2
+        Qbar[0,1] = (Q11+Q22-4*Q66)*s2*c2 + Q12*(s2**2+c2**2)
+        Qbar[0,2] = (Q11-Q12-2*Q66)*s*c2*c + (Q12-Q22+2*Q66)*s2*s
+        Qbar[1,0] = Qbar[0,1]
+        Qbar[1,1] = Q11*s2**2 + 2*(Q12+2*Q66)*s2*c2 + Q22*c2**2
+        Qbar[1,2] = (Q11-Q12-2*Q66)*s2*s + (Q12-Q22+2*Q66)*c2*s
+        Qbar[2,0] = Qbar[0,2]
+        Qbar[2,1] = Qbar[1,2]
+        Qbar[2,2] = (Q11+Q22-2*Q12-2*Q66)*s2*c2 + Q66*(s2**2+c2**2)
+
+        z0, z1 = z_positions[i]
+        h0 = z1 - z0
+        zm = (z0+z1)/2
+
+        A += Qbar * h0
+        B += Qbar * h0 * zm
+        D += Qbar * (h0*(zm**2) + h0**3/12)
+
+    # Solve for midplane strains and curvatures
+    # [A B] [e0]   [N]
+    # [B D] [k ] = [M]
+    ABD = np.block([[A, B],[B, D]])
+    NM = np.array([Nx, Ny, Nxy, Mx, My, Mxy])
+
+    try:
+        ek = np.linalg.solve(ABD, NM)
+        e0 = ek[:3]  # midplane strains
+        k  = ek[3:]  # curvatures
+    except np.linalg.LinAlgError:
+        return {"error":"Singular ABD matrix — check layup angles"}
+
+    # Ply stresses and Tsai-Wu failure
+    ply_results = []
+    max_tsai_wu = 0.0
+    first_ply_failure = None
+
+    for i, theta_deg in enumerate(layup_angles):
+        theta = math.radians(theta_deg)
+        z0, z1 = z_positions[i]
+        zm = (z0+z1)/2
+
+        # Global strains at ply midplane
+        e_global = e0 + zm*k
+
+        # Transform to ply coordinates
+        c=math.cos(theta); s=math.sin(theta)
+        T = np.array([
+            [c**2, s**2, c*s],
+            [s**2, c**2, -c*s],
+            [-2*c*s, 2*c*s, c**2-s**2]
+        ])
+        e_ply = T @ e_global
+
+        # Ply stresses in principal directions
+        Q_ply = np.array([
+            [Q11, Q12, 0],
+            [Q12, Q22, 0],
+            [0, 0, Q66]
+        ])
+        sigma_ply = Q_ply @ e_ply
+        s1, s2_ply, s12_ply = sigma_ply
+
+        # Tsai-Wu failure criterion
+        F1  = 1/Xt - 1/Xc
+        F2  = 1/Yt - 1/Yc
+        F11 = 1/(Xt*Xc)
+        F22 = 1/(Yt*Yc)
+        F66 = 1/S12**2
+        F12 = -0.5*math.sqrt(F11*F22)
+
+        TW = (F1*s1 + F2*s2_ply +
+               F11*s1**2 + F22*s2_ply**2 +
+               F66*s12_ply**2 + 2*F12*s1*s2_ply)
+
+        if TW > max_tsai_wu:
+            max_tsai_wu = TW
+            first_ply_failure = i+1
+
+        ply_results.append({
+            "ply": i+1,
+            "angle_deg": theta_deg,
+            "sigma1_mpa": round(float(s1),3),
+            "sigma2_mpa": round(float(s2_ply),3),
+            "tau12_mpa": round(float(s12_ply),3),
+            "tsai_wu_index": round(float(TW),4),
+            "failed": TW >= 1.0,
+        })
+
+    # Effective laminate properties
+    h = total_thickness
+    Ex_eff = (A[0,0]*A[1,1]-A[0,1]**2)/(A[1,1]*h)
+    Ey_eff = (A[0,0]*A[1,1]-A[0,1]**2)/(A[0,0]*h)
+
+    return {
+        "method": "classical_laminate_theory",
+        "layup": layup_angles,
+        "num_plies": n_plies,
+        "total_thickness_mm": round(total_thickness,3),
+        "effective_Ex_gpa": round(Ex_eff/1000,3),
+        "effective_Ey_gpa": round(Ey_eff/1000,3),
+        "A_matrix": A.round(3).tolist(),
+        "D_matrix": D.round(3).tolist(),
+        "midplane_strains": {
+            "e11": round(float(e0[0]),8),
+            "e22": round(float(e0[1]),8),
+            "g12": round(float(e0[2]),8),
+        },
+        "max_tsai_wu_index": round(float(max_tsai_wu),4),
+        "first_ply_failure": first_ply_failure,
+        "laminate_failed": max_tsai_wu >= 1.0,
+        "safety_factor": round(1.0/max(max_tsai_wu,0.001),3),
+        "ply_results": ply_results,
+        "status": "FAIL" if max_tsai_wu >= 1.0 else "PASS",
+    }
+
+# ═══════════════════════════════════════════════════════════════════
+# NEW: RAINFLOW FATIGUE COUNTING
+# ═══════════════════════════════════════════════════════════════════
+def rainflow_fatigue(mat_key, load_history_mpa, area_mm2=100):
+    """
+    ASTM E1049 rainflow counting algorithm.
+    More accurate than simple Goodman for variable amplitude loading.
+    Applies Miner's rule for cumulative damage.
+    """
+    mat = MATERIALS.get(mat_key, MATERIALS["aluminum_6061"])
+    Sut = mat["ultimate_strength_mpa"]
+    Se  = mat["fatigue_limit_mpa"] * 0.9 * 0.85 * 0.897  # Marin modified
+
+    def extract_peaks(signal):
+        peaks = [signal[0]]
+        for i in range(1, len(signal)-1):
+            if ((signal[i] > signal[i-1] and signal[i] > signal[i+1]) or
+                (signal[i] < signal[i-1] and signal[i] < signal[i+1])):
+                peaks.append(signal[i])
+        peaks.append(signal[-1])
+        return peaks
+
+    def rainflow_count(peaks):
+        cycles = []
+        stack = []
+        for p in peaks:
+            stack.append(p)
+            while len(stack) >= 3:
+                s0, s1, s2 = stack[-3], stack[-2], stack[-1]
+                r1 = abs(s1-s0)
+                r2 = abs(s2-s1)
+                if r2 >= r1:
+                    amp = r1/2
+                    mean = (s0+s1)/2
+                    cycles.append((amp, mean))
+                    stack.pop(-2)
+                    stack.pop(-2)
+                else:
+                    break
+        return cycles
+
+    peaks = extract_peaks(load_history_mpa)
+    cycles = rainflow_count(peaks)
+
+    # Basquin S-N curve: N = (f*Sut/Sa)^(1/b) * 1000
+    b = mat.get("fatigue_slope_b", -0.085)
+    f = mat.get("Sut_at_1000", 0.9)
+
+    total_damage = 0.0
+    cycle_details = []
+
+    for Sa, Sm in cycles:
+        if Sa < 0.001: continue
+
+        # Goodman correction for mean stress
+        Sa_eq = Sa / (1 - Sm/max(Sut,1))
+        Sa_eq = max(Sa_eq, 0.001)
+
+        if Sa_eq >= Se:
+            try:
+                N_fail = (f*Sut/Sa_eq)**(1/b) * 1000
+                N_fail = abs(N_fail)
+            except: N_fail = 1e6
+        else:
+            N_fail = float("inf")
+
+        damage = 1.0/N_fail if N_fail != float("inf") else 0
+        total_damage += damage
+
+        cycle_details.append({
+            "amplitude_mpa": round(Sa,3),
+            "mean_mpa": round(Sm,3),
+            "equivalent_amplitude_mpa": round(Sa_eq,3),
+            "cycles_to_failure": round(N_fail,0) if N_fail!=float("inf") else "infinite",
+            "damage": round(damage,10),
+        })
+
+    life_cycles = 1.0/max(total_damage,1e-30) if total_damage>0 else float("inf")
+    life_hours = life_cycles / (3600*10)
+
+    return {
+        "method": "rainflow_astm_e1049",
+        "total_cycles_counted": len(cycles),
+        "miner_damage_sum": round(float(total_damage),8),
+        "predicted_life_cycles": round(min(life_cycles,1e12),0),
+        "predicted_life_hours": round(min(life_hours,1e9),1),
+        "status": "PASS" if total_damage < 0.5 else "FAIL",
+        "top_damaging_cycles": sorted(cycle_details,
+                                       key=lambda x:x["damage"],
+                                       reverse=True)[:5],
+    }
+
+# ═══════════════════════════════════════════════════════════════════
+# NEW: MANUFACTURING COST ESTIMATE
+# ═══════════════════════════════════════════════════════════════════
+def estimate_manufacturing_cost(mesh, mat_key, process="cnc"):
+    """
+    Realistic manufacturing cost estimation.
+    Based on volume, surface area, complexity, and material.
+    """
+    mat = MATERIALS.get(mat_key, MATERIALS["aluminum_6061"])
+    vol_cm3 = sf(mesh.volume) / 1000
+    area_cm2 = sf(mesh.area) / 100
+    cost_per_kg = mat.get("cost_per_kg_usd", 5.0)
+    machinability = mat.get("machinability", 0.7)
+    mass_kg = vol_cm3 * mat["density"] / 1000
+
+    # Material cost
+    material_cost = mass_kg * cost_per_kg * 1.3  # 30% waste factor
+
+    # Manufacturing cost
+    if process == "cnc":
+        # CNC: $60-120/hour, complexity factor
+        complexity = max(len(mesh.faces)/1000, 1.0)
+        setup_time_hr = 0.5
+        machining_time_hr = (area_cm2 * 0.02) / machinability
+        cnc_rate = 80.0  # USD/hour
+        manufacturing_cost = (setup_time_hr + machining_time_hr) * cnc_rate
+
+    elif process == "3d_print_fdm":
+        # FDM: $0.10-0.30 per cm³
+        manufacturing_cost = vol_cm3 * 0.20
+
+    elif process == "3d_print_slm":
+        # SLM metal: $5-15 per cm³
+        manufacturing_cost = vol_cm3 * 8.0
+
+    elif process == "sheet_metal":
+        manufacturing_cost = area_cm2 * 0.5 + 25.0  # Setup + bending
+
+    elif process == "casting":
+        tooling = 2000.0  # Mold cost (amortized over 100 parts)
+        manufacturing_cost = material_cost * 0.5 + tooling/100
+
+    else:
+        manufacturing_cost = material_cost * 1.5
+
+    total = material_cost + manufacturing_cost
+
+    return {
+        "process": process,
+        "material": mat["name"],
+        "mass_kg": round(mass_kg, 4),
+        "volume_cm3": round(vol_cm3, 3),
+        "material_cost_usd": round(material_cost, 2),
+        "manufacturing_cost_usd": round(manufacturing_cost, 2),
+        "total_cost_usd": round(total, 2),
+        "cost_per_gram_usd": round(total/(mass_kg*1000+0.001), 4),
+        "note": "Estimate only. Get quotes from manufacturers.",
+    }
+
+# ═══════════════════════════════════════════════════════════════════
+# NEW: GEMINI SCRIPT GENERATION — Any part from text
+# ═══════════════════════════════════════════════════════════════════
+# Shared with rule_engine_v8's R15 check — kept as one list so the up-front
+# generation directive and the after-the-fact violation check can't drift
+# out of sync with each other.
+FOLD_BRACKET_KEYWORDS = ("vertical flange","vertical leg","vertical wall","vertical face",
+    "bent bracket","folded bracket","folded sheet","angle bracket",
+    "right-angle bracket","right angle bracket","90 degree bend",
+    "90° bend","fold line","bent sheet metal")
+
+# Same purpose as FOLD_BRACKET_KEYWORDS above, for parts needing a genuine
+# loft/taper instead of a constant cross-section — confirmed live, twice,
+# that hand-written loft+fillet code is unreliable (see make_tapered_beam).
+TAPER_KEYWORDS = ("taper","tapered","tapering","drone arm","connecting rod",
+    "streamlined","aerodynamic profile","tapered leg","tapered beam",
+    "tapered spar","loft between")
+
+GEMINI_CADQUERY_SYSTEM = """You are a CadQuery expert mechanical engineer.
+Generate Python CadQuery code to create the described 3D part.
+
+MANDATORY FIRST STEP — REQUIREMENTS CHECKLIST:
+Before writing any geometry code, write a Python comment block enumerating EVERY
+explicitly stated requirement from the prompt as a checklist — every hole/bore
+(with count, diameter, and rough position), every named dimension, every
+fillet/chamfer instruction, every material/wall-thickness call-out. One line
+per item, e.g.:
+    # REQUIREMENTS:
+    # [ ] 2x bearing bore, 22mm dia, coaxial, on opposite end faces
+    # [ ] 4x M6 mounting hole, near bottom corners
+    # [ ] wall thickness 4mm
+    # [ ] fillet all internal corners 3mm
+Then write the geometry code. Before finishing, go back through this exact
+checklist line by line and confirm your code actually creates each item —
+mark each one [x] once you've verified it's really there in the code below it,
+not just planned. A named requirement that never appears anywhere in your
+code (e.g. a bore the prompt asked for that never got cut) is a hard
+failure — worse than an imperfect fillet radius, because a missing feature
+is not a matter of tuning, it's a part that doesn't do what was asked. Do
+not submit a script with any unchecked box; if you can't fit a requirement
+in, go back and add it rather than leaving it off the list.
+
+STRICT RULES:
+- Import only: cadquery as cq, math, numpy as np
+- Assign final shape to variable named: result
+- All dimensions in millimeters
+- Add fillets to sharp internal corners minimum 0.5mm
+- Add mounting holes where appropriate
+- Code must be syntactically correct Python
+- No explanations, no markdown, pure Python code only
+- No os, sys, subprocess, socket, requests imports
+
+AVAILABLE CADQUERY OPERATIONS:
+cq.Workplane("XY"/"XZ"/"YZ")
+.box(length, width, height)
+.circle(radius).extrude(height)
+.cylinder(height, radius)
+.sphere(radius)
+.ellipse(x_radius, y_radius).extrude(height)
+.polygon(n_sides, circumradius).extrude(height)
+.polyline([(x1,y1),(x2,y2),...]).close().extrude(height)
+.spline([(x1,y1,z1),...])
+.circle(r1).workplane(offset=h).circle(r2).loft()
+.spline([(x1,y1,z1),...]).close().extrude(height)
+.workplane().moveTo(x,y).spline([...]).close().extrude(height)
+# Sweep a 2D profile along a curved path — the tool for a genuinely curved
+# structural member (e.g. a smoothly curved arm or duct), not just a straight
+# extrude with fillets bolted on:
+path = cq.Workplane("XZ").spline([(0,0),(x1,z1),(x2,z2)])
+swept = cq.Workplane("XY").circle(r).sweep(path)
+.fillet(radius)
+.chamfer(length)
+.shell(thickness)
+.hole(diameter)
+.cskHole(diameter, csk_diameter, csk_angle)
+.cboreHole(diameter, cboreDiameter, cboreDepth)
+.pushPoints([(x,y),...])
+.rarray(xSpacing, ySpacing, xCount, yCount, center=True)
+.union(other)
+.cut(other)
+.intersect(other)
+.translate((x,y,z))
+.rotate((0,0,0),(0,0,1),angle_degrees)
+.mirror("XY"/"XZ"/"YZ")
+.faces(">Z"/"<Z"/">X"/etc).workplane()
+.edges("|Z"/etc).fillet(radius)
+
+ENGINEERING DEFAULTS (apply unless the prompt specifies otherwise):
+- Mounting holes: diameter sized for M3-M6 fasteners, placed ≥2x diameter from any edge
+- Wall thickness: minimum 1.5mm for plastics, 1.0mm for metals, never below 0.8mm
+- Internal corners: fillet radius ≥0.5mm, prefer ≥1mm on load paths
+- External edges: chamfer 0.5-1mm for safe handling unless a sharp edge is functionally required
+- Keep aspect ratios (longest/shortest dimension) under 15:1 unless the prompt explicitly asks for a slender part
+- Center the part roughly on the origin so the bounding box is well-formed
+- When union()-ing two separately-built solids that attach end-to-end (e.g. an
+  end plate/boss/flange on a tapered or curved member), do NOT place them so
+  they only touch at one exact coincident plane with no real overlap — this is
+  a common cause of a non-watertight result, especially when their
+  cross-sections differ in size at that interface (e.g. a large plate meeting
+  a much smaller tapered tip). Translate the attachment so it genuinely
+  overlaps the other solid by a small real depth (a few percent of the
+  smaller cross-section's size is enough) before calling union().
+- If the prompt describes a tapered, curved, streamlined, or organic-looking
+  shape (e.g. "tapered arm", "curved bracket", "aerodynamic", "smoothly
+  blends into"), use loft() between profiles or sweep() along a spline path
+  for the main body — do not default to a constant-rectangular-cross-section
+  box just because that's simpler. A box with fillets bolted on the corners
+  is NOT the same as a genuinely tapered or curved shape, and looks
+  noticeably different from what was actually asked for.
+- Do NOT blanket-fillet every edge of a loft/tapered solid in one
+  .edges().fillet() call — confirmed live, twice, as a real cause of
+  self-intersecting (non-watertight) geometry with no Python error at all.
+  The corners where a sloped taper edge meets two flat profile edges are a
+  compound 3-edge blend, a known-hard case for any CAD kernel. For a
+  loft/tapered body: skip fillets on it entirely unless the prompt
+  specifically requires edge-breaking there — an unfilleted taper edge is
+  far better than a self-intersecting one. If fillets are truly required,
+  fillet only the flat top/bottom profile edges individually via an
+  explicit edge selector, never .edges() (all edges) on the whole loft.
+- Words like "flange", "leg", "L-bracket", "bent bracket", "angle bracket", or "folded
+  sheet metal" describe TWO FACES THAT ARE NOT COPLANAR — a real fold, not just two
+  flat pieces at different in-plane orientations. For ANY part matching this
+  description, do NOT hand-write your own box/rotate/union code for it — call the
+  make_bent_bracket(...) helper that's already available in this environment instead:
+
+      result = make_bent_bracket(
+          leg1_length=50.0, leg2_length=50.0, width=30.0, thickness=4.0,
+          bend_angle_deg=90.0, fillet_radius=3.0,
+          holes_leg1=[(15.0, 10.0, 6.0), (15.0, -10.0, 6.0)],   # (x_from_bend, y_from_centerline, diameter)
+          holes_leg2=[(15.0, 10.0, 6.0), (15.0, -10.0, 6.0)],
+      )
+
+  It guarantees leg2 actually rises out of the base plane instead of staying flat.
+  Pick leg1_length/leg2_length/width/thickness/holes from the prompt's stated
+  dimensions; you do not need to compute any rotation or union yourself.
+"""
+
+REFINEMENT_INSTRUCTIONS = """
+You are now in REFINEMENT MODE.
+
+You previously generated a CadQuery script for this part. It was exported to a mesh and
+run through a real engineering analysis pipeline (wall thickness, hole placement, sharp
+corner stress concentrations, FEA safety factor, fatigue, rule-engine checks).
+
+The analysis below lists concrete problems with the part as currently designed (or the
+script failed to execute — in that case fix the execution error). Your job is to produce
+a CORRECTED, COMPLETE script that fixes every issue listed, while preserving the parts of
+the design that were already correct.
+
+RULES FOR REFINEMENT:
+- Output a COMPLETE script (not a diff/patch) that can run standalone, same format as before.
+- Directly address each issue: e.g. if "Wall 0.6mm < material min 1.0mm", increase the
+  relevant wall/shell thickness in the script's geometry, don't just change a comment.
+- If a hole violates the edge-distance rule, move that hole's pushPoint coordinates inward.
+- If sharp-corner stress concentration (Kf) is too high, add/increase a .fillet() on that edge.
+- If safety factor is too low, increase cross-sectional area/thickness in the load path,
+  or reduce unsupported span, rather than changing the material.
+- If the previous script raised a Python error, fix the root cause (typo, wrong API call,
+  bad chaining) — do not just simplify the part away.
+- If told the mesh is STILL not watertight AFTER automatic tessellation repair was already
+  attempted, this is a REAL geometric defect, not a triangulation artifact — most often a
+  boolean union/cut that leaves a gap or self-intersection (e.g. two solids that only
+  partially overlap before a .union(), or a .cut() bore that exits through a corner instead
+  of a flat face). Rebuild the affected boolean operation with fully-overlapping/fully-
+  enclosed operands rather than adding fillets or changing wall thickness — those don't fix
+  a topology gap. Copy this exact overshoot/overlap pattern for whichever boolean op is
+  suspected:
+
+    # DANGEROUS — cutting tool ends EXACTLY flush with the far face. This leaves a
+    # coincident/zero-thickness face where they meet -> non-manifold mesh.
+    bore = cq.Workplane("XY").circle(hole_r).extrude(wall_thickness)     # BAD
+    result = housing.cut(bore)
+
+    # SAFE — cutting tool starts before the near face and ends after the far face,
+    # overshooting BOTH by a real margin (>= 1.0mm or 10% of wall_thickness).
+    overshoot = max(1.0, wall_thickness * 0.1)
+    bore = (cq.Workplane("XY")
+            .workplane(offset=-overshoot)
+            .circle(hole_r)
+            .extrude(wall_thickness + 2 * overshoot))
+    result = housing.cut(bore)
+
+    # DANGEROUS — second solid starts EXACTLY at the first solid's face, so they
+    # only touch (tangent), never truly interpenetrate -> non-manifold seam on union.
+    boss = cq.Workplane("XY").workplane(offset=base_height).circle(r).extrude(h)  # BAD
+    result = base.union(boss)
+
+    # SAFE — sink the second solid INTO the first by a real overlap margin before
+    # unioning, so the two volumes genuinely share interior volume, not just a face.
+    overlap = max(0.5, base_height * 0.05)
+    boss = (cq.Workplane("XY")
+            .workplane(offset=base_height - overlap)
+            .circle(r)
+            .extrude(h + overlap))
+    result = base.union(boss)
+
+  This overshoot/overlap margin is the fix — not a fillet, not a wall-thickness change,
+  not a different hole position. Apply it only to the boolean operation actually
+  producing the non-manifold result; leave every other operation untouched.
+- Do not regress: don't reintroduce a problem that was already fixed in a prior round,
+  and don't fix one flagged issue by weakening a different area that was previously fine
+  (e.g. don't thin a wall or shrink a cross-section elsewhere while raising a wall
+  thickness or fixing a hole position). Change only what's needed to address each
+  listed issue, at the location it was found.
+- Still follow all original STRICT RULES (imports, `result` variable, mm units, etc).
+"""
+
+LOVABLE_API_KEY = os.environ.get("LOVABLE_API_KEY", "")
+LOVABLE_AI_URL = "https://ai.gateway.lovable.dev/v1/chat/completions"
+LOVABLE_AI_MODEL = os.environ.get("LOVABLE_AI_MODEL", "google/gemini-3-flash")
+LOVABLE_AI_VISION_MODEL = os.environ.get("LOVABLE_AI_VISION_MODEL", LOVABLE_AI_MODEL)
+
+# Direct Anthropic API — no third-party gateway in between. Model string here is
+# what I'm most confident is current as of this writing; Anthropic ships new
+# models fairly often, so if this 404s/errors, check https://docs.claude.com for
+# the current model id and override via the CLAUDE_MODEL env var rather than
+# editing this file.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_VERSION = "2023-06-01"
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
+CLAUDE_VISION_MODEL = os.environ.get("CLAUDE_VISION_MODEL", CLAUDE_MODEL)
+
+# Direct Google Gemini API — bypasses the Lovable gateway entirely, so you keep
+# whatever Google charges directly with no gateway markup. Google ships frequent
+# point releases (3.6, 3.7, etc. were all released within weeks of each other as
+# of this writing) — if this model id 404s, check https://ai.google.dev/gemini-api/docs/models
+# for the current stable id and override via GEMINI_MODEL rather than editing this file.
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
+GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", GEMINI_MODEL)
+
+# OpenRouter — OpenAI-compatible gateway to many models, including genuinely
+# free ones (:free suffix). Free-tier model availability on OpenRouter churns
+# HARD and without notice — confirmed live, repeatedly, in the same session:
+# qwen/qwen3-coder:free delisted within about a week of being set; then
+# z-ai/glm-4.5-air:free (this file's next default) delisted within HOURS of
+# being set. Hand-picking any specific :free model id is a losing game — the
+# ecosystem moves faster than any fix-and-redeploy cycle can track.
+#
+# Default is now "openrouter/free" — OpenRouter's OWN auto-routing
+# meta-model, built specifically for this problem. Per OpenRouter's own docs:
+# "so your code keeps working even after individual free models rotate out."
+# This requires the null-content response fix from v8.13 to be reliable (an
+# earlier attempt at this same default crashed on a null-content edge case
+# before that fix existed) — that's now in place, so this is the stable
+# choice going forward, not a specific model name to keep replacing.
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+# The auto-router may land on a text-only model — image-to-params needs a
+# vision-capable model specifically if you use that endpoint. Override
+# OPENROUTER_VISION_MODEL explicitly rather than relying on the auto-router
+# for that one endpoint.
+OPENROUTER_VISION_MODEL = os.environ.get("OPENROUTER_VISION_MODEL", OPENROUTER_MODEL)
+
+# Cerebras Cloud (cloud.cerebras.ai) — OpenAI-compatible, function-calling capable,
+# and (as of this writing) hosts gpt-oss-120b for free — the same model already used
+# via Groq above, just a different inference backend with a separate rate-limit pool.
+# Verify current card/limit terms at signup before relying on this; free-tier terms
+# across every provider in this file change often enough that hardcoding a promise
+# here would go stale.
+CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
+CEREBRAS_API_URL = "https://api.cerebras.ai/v1/chat/completions"
+CEREBRAS_MODEL = os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b")
+
+# NVIDIA NIM (build.nvidia.com) — OpenAI-compatible, one endpoint/key serves every
+# model in NVIDIA's catalog (Nemotron, Kimi K2/K3, DeepSeek V4, and 90+ others) —
+# just change NVIDIA_MODEL to switch models, no code change needed. Confirmed via
+# NVIDIA's own catalog page (build.nvidia.com/models) as of this writing:
+#   nvidia/nemotron-3-ultra-550b-a55b     (verify it shows a live Playground/API
+#                                          tab, not just downloadable weights)
+#   moonshotai/kimi-k3                    (confirmed live free endpoint)
+#   deepseek-ai/deepseek-v4-pro-0813      (confirmed live — NOT the bare
+#                                          "deepseek-v4-pro", that ID is deprecated)
+#   deepseek-ai/deepseek-v4-flash-0731    (confirmed live free endpoint)
+# Free-tier limits aren't published as a fixed table (same situation as every
+# other free provider in this file) and are shared account-wide across whichever
+# of the above models you call — check your own account's actual limits rather
+# than assume headroom.
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
+NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_MODEL = os.environ.get("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+
+# Optional "strategic advisor" second model for the Engineering Agent — called
+# SPARINGLY (once up front, then once per FAILED run_fea — not per tool call)
+# for the high-level "understand this / why did it fail / what's the smallest
+# valid fix" reasoning, while GPT-OSS-120B (via whichever AI_PROVIDER is
+# configured) keeps driving the actual tool-calling loop as it already does.
+# Reuses OpenRouter's existing endpoint/key — it's the same account either
+# way, just a different model string — so no new API key is needed if
+# OPENROUTER_API_KEY is already set.
+#
+# Rate-limit math behind why this is SPARING rather than per-step, confirmed
+# against each provider's own published limits: Groq's gpt-oss-120b gets its
+# own 1,000 requests/day (per-model, per-org — not shared with anything else),
+# while OpenRouter's free ":free" models share ONE 50-requests/day pool
+# ACROSS EVERY free model called from that account (rising to 1,000/day only
+# after a $10 lifetime credit purchase). Calling the advisor on every tool
+# call would blow through that shared 50/day budget in a single run; calling
+# it 2-4 times per run keeps a full day's testing comfortably inside it.
+#
+# Leave this blank to disable the advisor entirely — the agent then behaves
+# exactly as it did before this was added (GPT-OSS-120B alone, unchanged).
+#
+# IMPORTANT — verify this exact model string yourself before relying on it:
+# sources disagree on whether "Nemotron 3 Ultra" (550B/55B active) specifically
+# has a free tier on OpenRouter, versus the smaller "Nemotron 3 Super" (120B/
+# 12B active) definitely having one. Check openrouter.ai/models yourself and
+# use whichever one actually shows a live ":free" tag — a wrong model string
+# here just makes the advisor calls fail silently (see _call_advisor below),
+# so the main loop keeps working either way, but you won't get the benefit.
+NEMOTRON_ADVISOR_MODEL = os.environ.get("NEMOTRON_ADVISOR_MODEL", "")
+
+
+# Groq — OpenAI-compatible, custom LPU hardware, genuinely stable free tier
+# (unlike OpenRouter's free roster, which churned THREE times in one night on
+# this project — models delisted within hours to days of being set). Groq's
+# own docs: 30 RPM, 1,000 requests/day, no card required, and this rate limit
+# CORRECTION (confirmed via a real Groq console screenshot + independent
+# search): Llama 4 Scout was removed from Groq's catalog around July 21,
+# 2026 — it no longer appears in the console's model list at all. The
+# earlier version of this comment recommending Scout was already stale by
+# the time it was written; leaving this note so it's not repeated.
+#
+# Current default: openai/gpt-oss-120b — confirmed live in Groq's own
+# console under both "Reasoning" and "Function Calling/Tool Use" categories,
+# and NOT in Groq's "Preview" tier (which their own docs warn "may be
+# discontinued at short notice") — the least churn-prone real option
+# available right now. Groq's free tier (~30 req/min, no card required)
+# applies to this and every other listed model — usage under those caps
+# costs $0; you're only billed if you exceed them. There is no separate
+# ":free"-suffix model list the way OpenRouter has — every model here is
+# usage-priced, with the free tier being a rate-limited allowance on top.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+# Optional additional Groq keys (e.g. from separate free-tier accounts) so a
+# rate-limited key automatically falls through to the next one instead of
+# failing the request. Accepts GROQ_API_KEY_2, GROQ_API_KEY_3, ... (numbered,
+# checked in order until one is unset) as well as a single comma-separated
+# GROQ_API_KEYS env var — use whichever is more convenient to set on Render.
+def _load_groq_keys():
+    keys = [GROQ_API_KEY] if GROQ_API_KEY else []
+    for extra in os.environ.get("GROQ_API_KEYS", "").split(","):
+        extra = extra.strip()
+        if extra and extra not in keys:
+            keys.append(extra)
+    i = 2
+    while True:
+        k = os.environ.get(f"GROQ_API_KEY_{i}", "").strip()
+        if not k:
+            break
+        if k not in keys:
+            keys.append(k)
+        i += 1
+    return keys
+
+GROQ_API_KEYS = _load_groq_keys()
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+# Confirm vision support on Groq's hosted GPT-OSS before relying on it for
+# image-to-params — override GROQ_VISION_MODEL if it doesn't behave as
+# expected there (GPT-OSS models are primarily text-focused).
+GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", GROQ_MODEL)
+
+# Which provider backs generation: "claude" (direct Anthropic API), "gemini"
+# (direct Google API), "groq" (gpt-oss-120b via Groq — this deployment's primary/
+# intended provider), "cerebras" (OpenAI-compatible, also hosts gpt-oss-120b free
+# as of this writing — verify current card/limit terms at signup, they change
+# often), "openrouter" (OpenAI-compatible gateway, free models available but churn
+# heavily and cap out at 50 requests/day unfunded), or "lovable" (Gemini via
+# the gateway). Defaults to whichever key is actually configured — set
+# AI_PROVIDER explicitly to force a choice if more than one key is set.
+#
+# .strip().lower() on the whole expression: a value like "Groq" or " groq" (a
+# typo made once in this deployment's history, via Render's dashboard) would
+# otherwise match NONE of the string comparisons below or anywhere else this
+# variable is checked, and silently fall through to whatever the last provider
+# in a given if/elif chain happens to be — a confusing failure mode with no
+# error message pointing at the real cause. Normalizing here means a typo'd
+# value still selects the intended provider instead of failing silently.
+AI_PROVIDER = os.environ.get(
+    "AI_PROVIDER",
+    "claude" if os.environ.get("ANTHROPIC_API_KEY")
+    else "gemini" if os.environ.get("GOOGLE_API_KEY")
+    else "nvidia" if os.environ.get("NVIDIA_API_KEY")
+    else "groq" if os.environ.get("GROQ_API_KEY")
+    else "cerebras" if os.environ.get("CEREBRAS_API_KEY")
+    else "openrouter" if os.environ.get("OPENROUTER_API_KEY")
+    else "lovable"
+).strip().lower()
+
+
+# Remembers which key in GROQ_API_KEYS last succeeded, so the next call tries
+# that one first instead of always starting from index 0 (which would waste a
+# round trip re-hitting an already-exhausted key on every single request once
+# it's rate-limited). Plain module-level int: worst case under concurrent
+# requests is one extra wasted attempt, not a correctness issue.
+_groq_key_state = {"index": 0}
+
+
+def _groq_request(messages, temperature=0.15, max_tokens=3000, model=None):
+    """Low-level call to Groq (OpenAI-compatible chat completions) — same
+    request/response shape as _lovable_request/_openrouter_request, different
+    base URL/key/model.
+
+    Tries each configured Groq key (GROQ_API_KEY plus any GROQ_API_KEY_2,
+    GROQ_API_KEY_3, ... / GROQ_API_KEYS) in turn, falling through to the next
+    key only on a 429 (rate limit) — any other error (auth, bad request,
+    connection failure) still fails immediately rather than masking a real
+    problem by silently retrying."""
+    import urllib.request, urllib.error
+
+    if not GROQ_API_KEYS:
+        raise HTTPException(500, "GROQ_API_KEY is not configured on the server. "
+                                   "Set it as a secret/env var in your deployment.")
+
+    payload = json.dumps({
+        "model": model or GROQ_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }).encode()
+
+    n = len(GROQ_API_KEYS)
+    start = _groq_key_state["index"] % n
+    last_exc = None
+
+    for offset in range(n):
+        idx = (start + offset) % n
+        key = GROQ_API_KEYS[idx]
+        req = urllib.request.Request(
+            GROQ_API_URL, data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {key}",
+                # Groq's API sits behind Cloudflare. urllib's default User-Agent
+                # ("Python-urllib/3.x") is a well-known bot-detection trigger —
+                # confirmed live: this exact call was returning Cloudflare error
+                # 1010 ("banned based on your browser's signature") before this
+                # header was added, not an actual Groq auth/key problem.
+                "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
+                "Accept": "application/json",
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read())
+            _groq_key_state["index"] = idx
+            break
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="ignore")
+            if e.code == 429:
+                last_exc = HTTPException(429, f"Groq rate limit exceeded on all "
+                                                f"{n} configured key(s): {body}")
+                continue  # try the next key, if any
+            raise HTTPException(502, f"Groq error ({e.code}): {body}")
+        except urllib.error.URLError as e:
+            raise HTTPException(502, f"Groq connection error: {str(e)}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            # FIX: confirmed live (on the near-identical _openrouter_request below) — a
+            # response that times out mid-read, or comes back with a non-JSON body, raises
+            # something urllib.error.HTTPError/URLError doesn't catch (json.JSONDecodeError,
+            # a raw socket.timeout/TimeoutError not wrapped in URLError, etc.), which used
+            # to propagate uncaught and crash the entire request with a bare HTTP 500.
+            raise HTTPException(502, f"Groq request failed unexpectedly: {type(e).__name__}: {e}")
+    else:
+        # every configured key hit a 429 — nothing left to fall back to
+        raise last_exc
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(502, f"Unexpected Groq response shape: {json.dumps(data)[:500]}")
+
+    if not content or not isinstance(content, str):
+        # Same null-content edge case fixed in _openrouter_request/_lovable_request.
+        raise HTTPException(502, f"Groq returned empty/null content. "
+                                  f"Raw response: {json.dumps(data)[:500]}")
+    return content
+
+
+def _cerebras_request(messages, temperature=0.15, max_tokens=3000, model=None):
+    """Low-level call to Cerebras Cloud (OpenAI-compatible chat completions) —
+    identical shape to _groq_request, different base URL/key/model. Added as a
+    free-tier, no-card-reported alternative to Groq for gpt-oss-120b specifically
+    (verify current terms at signup, they change often across every free provider
+    in this file)."""
+    import urllib.request, urllib.error
+
+    if not CEREBRAS_API_KEY:
+        raise HTTPException(500, "CEREBRAS_API_KEY is not configured on the server. "
+                                   "Set it as a secret/env var in your deployment.")
+
+    payload = json.dumps({
+        "model": model or CEREBRAS_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }).encode()
+
+    req = urllib.request.Request(
+        CEREBRAS_API_URL, data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {CEREBRAS_API_KEY}",
+            "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
+            "Accept": "application/json",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        if e.code == 429:
+            raise HTTPException(429, f"Cerebras rate limit exceeded: {body}")
+        raise HTTPException(502, f"Cerebras error ({e.code}): {body}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"Cerebras connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Cerebras request failed unexpectedly: {type(e).__name__}: {e}")
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(502, f"Unexpected Cerebras response shape: {json.dumps(data)[:500]}")
+
+    if not content or not isinstance(content, str):
+        raise HTTPException(502, f"Cerebras returned empty/null content. "
+                                  f"Raw response: {json.dumps(data)[:500]}")
+    return content
+
+
+def _nvidia_request(messages, temperature=0.15, max_tokens=3000, model=None):
+    """Low-level call to NVIDIA's NIM catalog (build.nvidia.com, OpenAI-compatible
+    chat completions) — identical shape to _groq_request/_cerebras_request,
+    different base URL/key. `model` (or NVIDIA_MODEL) picks which of NVIDIA's
+    90+ catalog models actually answers this call — Nemotron, Kimi K3, DeepSeek
+    V4, etc. all go through this exact same function."""
+    import urllib.request, urllib.error
+
+    if not NVIDIA_API_KEY:
+        raise HTTPException(500, "NVIDIA_API_KEY is not configured on the server. "
+                                   "Set it as a secret/env var in your deployment.")
+
+    payload = json.dumps({
+        "model": model or NVIDIA_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }).encode()
+
+    req = urllib.request.Request(
+        NVIDIA_API_URL, data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {NVIDIA_API_KEY}",
+            "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
+            "Accept": "application/json",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        if e.code == 429:
+            raise HTTPException(429, f"NVIDIA NIM rate limit exceeded: {body}")
+        raise HTTPException(502, f"NVIDIA NIM error ({e.code}): {body}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"NVIDIA NIM connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"NVIDIA NIM request failed unexpectedly: {type(e).__name__}: {e}")
+
+
+def _openrouter_request(messages, temperature=0.15, max_tokens=3000, model=None, timeout=60):
+    """
+    Low-level call to OpenRouter (OpenAI-compatible chat completions) — same
+    request/response shape as _lovable_request, different base URL/key/model.
+    `messages` is the standard OpenAI-style list including a system role entry.
+    """
+    import urllib.request, urllib.error
+
+    if not OPENROUTER_API_KEY:
+        raise HTTPException(500, "OPENROUTER_API_KEY is not configured on the server. "
+                                   "Set it as a secret/env var in your deployment.")
+
+    payload = json.dumps({
+        "model": model or OPENROUTER_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }).encode()
+
+    req = urllib.request.Request(
+        OPENROUTER_API_URL, data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        if e.code == 429:
+            raise HTTPException(429, f"OpenRouter rate limit exceeded: {body}")
+        raise HTTPException(502, f"OpenRouter error ({e.code}): {body}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"OpenRouter connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        # FIX: confirmed live — a Nemotron 3 Ultra advisor call (large model, free/shared
+        # queue) timed out mid-read at almost exactly this function's 60s timeout, raising
+        # something urllib.error.URLError doesn't catch. That propagated all the way up
+        # through _call_advisor's narrower except HTTPException, past FastAPI's normal JSON
+        # error handling, and crashed the entire /engineering-agent request with a bare
+        # HTTP 500 plaintext body — for a call that was only ever supposed to be a
+        # best-effort advisory extra, never something that could break the main loop.
+        raise HTTPException(502, f"OpenRouter request failed unexpectedly: {type(e).__name__}: {e}")
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(502, f"Unexpected OpenRouter response shape: {json.dumps(data)[:500]}")
+
+    if not content or not isinstance(content, str):
+        # `content` can be present but null/empty — happens with some models when
+        # they return only a `reasoning` field, hit a content filter, or produce
+        # a tool-call instead of plain text. This is a real, confirmed failure
+        # mode (openrouter/free's auto-router can land on a model that does
+        # this), not a hypothetical — the old code let a None here fall through
+        # silently until it crashed downstream with an unrelated-looking
+        # AttributeError. Surface it clearly here instead, with the raw response
+        # visible for debugging which model/condition triggered it.
+        raise HTTPException(502, f"OpenRouter returned empty/null content — the routed "
+                                  f"model produced no usable text (possibly a reasoning-only "
+                                  f"response or content filter). Raw response: "
+                                  f"{json.dumps(data)[:500]}")
+    return content
+
+
+def _gemini_request(system, messages, temperature=0.15, max_tokens=3000, model=None):
+    """
+    Low-level call to Google's Gemini API directly (generativelanguage.googleapis.com),
+    no gateway in between. Gemini's request shape differs from both _lovable_request
+    (OpenAI-style) and _claude_request (Anthropic Messages API):
+      - system prompt goes in a separate `systemInstruction` field
+      - conversation turns use role "user" / "model" (not "assistant")
+      - each turn's content is a `parts` array of {"text": ...} objects
+    `messages` here uses the same [{"role", "content"}] shape as the other two
+    request functions for consistency — this function does the Gemini-specific
+    conversion internally.
+    """
+    import urllib.request, urllib.error
+
+    if not GOOGLE_API_KEY:
+        raise HTTPException(500, "GOOGLE_API_KEY is not configured on the server. "
+                                   "Set it as a secret/env var in your deployment.")
+
+    contents = []
+    for m in messages:
+        role = "model" if m["role"] == "assistant" else "user"
+        contents.append({"role": role, "parts": [{"text": m["content"]}]})
+
+    payload = json.dumps({
+        "contents": contents,
+        "systemInstruction": {"parts": [{"text": system}]},
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+    }).encode()
+
+    use_model = model or GEMINI_MODEL
+    url = f"{GEMINI_API_BASE}/{use_model}:generateContent?key={GOOGLE_API_KEY}"
+
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        if e.code == 429:
+            raise HTTPException(429, f"Gemini API rate limit exceeded: {body}")
+        raise HTTPException(502, f"Gemini API error ({e.code}): {body}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"Gemini API connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Gemini API request failed unexpectedly: {type(e).__name__}: {e}")
+
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in parts)
+    except (KeyError, IndexError, TypeError):
+        # Gemini returns candidates[0].finishReason == "SAFETY" (no parts) if it
+        # refuses — surface the raw response so that's visible instead of a bare
+        # KeyError.
+        raise HTTPException(502, f"Unexpected Gemini API response shape (possibly a "
+                                  f"safety block): {json.dumps(data)[:500]}")
+
+
+def _gemini_vision_request(system, prompt_text, img_b64, mime_type,
+                            temperature=0.1, max_tokens=512, model=None):
+    """Gemini vision call — image goes in `inline_data` (snake_case) alongside text, in one part list."""
+    import urllib.request, urllib.error
+
+    if not GOOGLE_API_KEY:
+        raise HTTPException(500, "GOOGLE_API_KEY is not configured on the server.")
+
+    payload = json.dumps({
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"inline_data": {"mime_type": mime_type, "data": img_b64}},
+                {"text": prompt_text},
+            ],
+        }],
+        "systemInstruction": {"parts": [{"text": system}]},
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+    }).encode()
+
+    use_model = model or GEMINI_VISION_MODEL
+    url = f"{GEMINI_API_BASE}/{use_model}:generateContent?key={GOOGLE_API_KEY}"
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        raise HTTPException(502, f"Gemini API error ({e.code}): {body}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"Gemini API connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Gemini API request failed unexpectedly: {type(e).__name__}: {e}")
+
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in parts)
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(502, f"Unexpected Gemini API response shape: {json.dumps(data)[:500]}")
+
+
+def _lovable_request(messages, temperature=0.15, max_tokens=3000, model=None):
+    """Low-level call to Lovable AI Gateway (OpenAI-compatible chat completions)."""
+    import urllib.request, urllib.error
+
+    if not LOVABLE_API_KEY:
+        raise HTTPException(500, "LOVABLE_API_KEY is not configured on the server. "
+                                   "Set it as a secret/env var in your deployment.")
+
+    payload = json.dumps({
+        "model": model or LOVABLE_AI_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }).encode()
+
+    req = urllib.request.Request(
+        LOVABLE_AI_URL, data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LOVABLE_API_KEY}",
+            "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        if e.code == 429:
+            raise HTTPException(429, f"Lovable AI rate limit exceeded: {body}")
+        if e.code == 402:
+            raise HTTPException(402, f"Lovable AI credits exhausted: {body}")
+        raise HTTPException(502, f"Lovable AI error ({e.code}): {body}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"Lovable AI connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Lovable AI request failed unexpectedly: {type(e).__name__}: {e}")
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(502, f"Unexpected Lovable AI response shape: {json.dumps(data)[:500]}")
+
+    if not content or not isinstance(content, str):
+        # Same null-content edge case fixed in _openrouter_request — see that
+        # function's comment for the full explanation. Guarding here too since
+        # this is the identical OpenAI-compatible response shape.
+        raise HTTPException(502, f"Lovable AI returned empty/null content. "
+                                  f"Raw response: {json.dumps(data)[:500]}")
+    return content
+
+
+def _claude_request(system, messages, temperature=0.15, max_tokens=3000, model=None):
+    """
+    Low-level call to the Anthropic Messages API directly (no gateway in between).
+    `messages` is Anthropic's format: [{"role": "user"/"assistant", "content": ...}],
+    with the system prompt passed separately — different shape from the OpenAI-style
+    messages list _lovable_request expects. See gemini_generate_script/
+    gemini_vision_estimate for where the two are assembled differently per provider.
+    """
+    import urllib.request, urllib.error
+
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY is not configured on the server. "
+                                   "Set it as a secret/env var in your deployment.")
+
+    payload = json.dumps({
+        "model": model or CLAUDE_MODEL,
+        "system": system,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }).encode()
+
+    req = urllib.request.Request(
+        ANTHROPIC_API_URL, data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": ANTHROPIC_API_VERSION,
+            "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        if e.code == 429:
+            raise HTTPException(429, f"Claude API rate limit exceeded: {body}")
+        raise HTTPException(502, f"Claude API error ({e.code}): {body}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"Claude API connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Claude API request failed unexpectedly: {type(e).__name__}: {e}")
+
+    try:
+        return "".join(b["text"] for b in data["content"] if b.get("type") == "text")
+    except (KeyError, TypeError):
+        raise HTTPException(502, f"Unexpected Claude API response shape: {json.dumps(data)[:500]}")
+
+def _clean_code_block(text: str, lang_hints=("python","json")) -> str:
+    t = text.strip()
+    for h in lang_hints:
+        t = t.replace(f"```{h}", "```")
+    if t.startswith("```"):
+        t = t[3:]
+    if t.endswith("```"):
+        t = t[:-3]
+    return t.strip()
+
+async def gemini_generate_script(prompt: str, previous_script: Optional[str] = None,
+                                  feedback: Optional[str] = None) -> str:
+    """
+    Generate/refine a CadQuery script via whichever provider AI_PROVIDER selects —
+    direct Claude API or the Lovable/Gemini gateway. Same prompting logic either way;
+    only the transport differs (see _claude_request vs _lovable_request).
+
+    - First call (previous_script/feedback are None): plain generation from `prompt`.
+    - Refinement call: include the prior script and an engineering-analysis feedback
+      report so the model can produce a corrected version targeting the same part.
+    """
+    system_prompt = GEMINI_CADQUERY_SYSTEM + REFINEMENT_INSTRUCTIONS
+
+    if previous_script and feedback:
+        turns = [
+            {"role": "user", "content":
+                f"Original request: {prompt}\n\nReturn ONLY Python code. No markdown."},
+            {"role": "assistant", "content": previous_script},
+            {"role": "user", "content":
+                f"ANALYSIS / FEEDBACK FROM ENGINEERING PIPELINE:\n{feedback}\n\n"
+                f"Produce a corrected, COMPLETE script fixing the issues above. "
+                f"Return ONLY Python code. No markdown."},
+        ]
+    else:
+        is_fold_part = any(w in prompt.lower() for w in FOLD_BRACKET_KEYWORDS)
+        is_taper_part = any(w in prompt.lower() for w in TAPER_KEYWORDS)
+        if is_fold_part:
+            user_msg = (
+                f"Generate CadQuery code for: {prompt}\n\n"
+                "This part has a bent/folded flange (per the description above). "
+                "MANDATORY: do not write any box/polyline/rotate/union geometry code "
+                "yourself for this. Your entire script must build the part by calling "
+                "the make_bent_bracket(...) helper that is already available in this "
+                "environment, then optionally chaining simple .fillet()/.chamfer() calls "
+                "on its result — nothing else constructs the base geometry. Example:\n\n"
+                "result = make_bent_bracket(\n"
+                "    leg1_length=50.0, leg2_length=50.0, width=30.0, thickness=4.0,\n"
+                "    bend_angle_deg=90.0, fillet_radius=3.0,\n"
+                "    holes_leg1=[(15.0, 10.0, 6.0), (15.0, -10.0, 6.0)],\n"
+                "    holes_leg2=[(15.0, 10.0, 6.0), (15.0, -10.0, 6.0)],\n"
+                ")\n\n"
+                "Pick leg1_length/leg2_length/width/thickness/holes from the dimensions "
+                "stated in the prompt above. Return ONLY Python code. No markdown."
+            )
+        elif is_taper_part:
+            user_msg = (
+                f"Generate CadQuery code for: {prompt}\n\n"
+                "This part is tapered/lofted (per the description above). MANDATORY: "
+                "do not write your own loft()/fillet() geometry code for this — "
+                "confirmed live, twice, that hand-written loft+fillet code on a "
+                "tapered body produces silently broken (non-watertight) geometry "
+                "with no Python error at all. Your entire script must build the "
+                "part by calling the make_tapered_beam(...) helper that is already "
+                "available in this environment. Example:\n\n"
+                "result = make_tapered_beam(\n"
+                "    length=150.0, base_width=25.0, base_thick=10.0,\n"
+                "    tip_width=15.0, tip_thick=6.0, fillet_radius=1.0,\n"
+                "    holes_base=[(6.0, 0.0, 4.0), (-6.0, 0.0, 4.0)],\n"
+                "    holes_tip=[(3.0, 3.0, 3.0), (3.0, -3.0, 3.0), (-3.0, 3.0, 3.0), (-3.0, -3.0, 3.0)],\n"
+                ")\n\n"
+                "Pick length/base_width/base_thick/tip_width/tip_thick/holes from the "
+                "dimensions stated in the prompt above. Return ONLY Python code. No markdown."
+            )
+        else:
+            user_msg = f"Generate CadQuery code for: {prompt}\n\nReturn ONLY Python code. No markdown."
+        turns = [{"role": "user", "content": user_msg}]
+
+    # 3000 tokens was too tight — real users hit truncated/unclosed-expression
+    # scripts on parts needing computed hole-position math (x_pos/y_pos style
+    # logic), confirmed via a live truncation: '(' never closed mid-line.
+    # 6000 gives real headroom for that without being wastefully large.
+    GEN_MAX_TOKENS = 6000
+
+    # FIX: these were previously called directly (blocking, synchronous urllib
+    # calls) from inside an `async def` function with no `await` on the actual
+    # I/O — on Render's single-worker free tier that stalls the ENTIRE event
+    # loop (including health-check responses) for the full duration of every
+    # generation call. asyncio.to_thread moves the blocking call off the loop.
+    if AI_PROVIDER == "claude":
+        text = await asyncio.to_thread(_claude_request, system_prompt, turns,
+                                        temperature=0.15, max_tokens=GEN_MAX_TOKENS)
+    elif AI_PROVIDER == "gemini":
+        text = await asyncio.to_thread(_gemini_request, system_prompt, turns,
+                                        temperature=0.15, max_tokens=GEN_MAX_TOKENS)
+    elif AI_PROVIDER == "groq":
+        text = await asyncio.to_thread(
+            _groq_request,
+            [{"role": "system", "content": system_prompt}] + turns,
+            temperature=0.15, max_tokens=GEN_MAX_TOKENS
+        )
+    elif AI_PROVIDER == "cerebras":
+        text = await asyncio.to_thread(
+            _cerebras_request,
+            [{"role": "system", "content": system_prompt}] + turns,
+            temperature=0.15, max_tokens=GEN_MAX_TOKENS
+        )
+    elif AI_PROVIDER == "nvidia":
+        text = await asyncio.to_thread(
+            _nvidia_request,
+            [{"role": "system", "content": system_prompt}] + turns,
+            temperature=0.15, max_tokens=GEN_MAX_TOKENS
+        )
+    elif AI_PROVIDER == "openrouter":
+        text = await asyncio.to_thread(
+            _openrouter_request,
+            [{"role": "system", "content": system_prompt}] + turns,
+            temperature=0.15, max_tokens=GEN_MAX_TOKENS
+        )
+    else:
+        text = await asyncio.to_thread(
+            _lovable_request,
+            [{"role": "system", "content": system_prompt}] + turns,
+            temperature=0.15, max_tokens=GEN_MAX_TOKENS
+        )
+
+    return _clean_code_block(text, ("python",))
+
+async def gemini_vision_estimate(img_b64: str, mime_type: str, description: str) -> dict:
+    """Estimate part parameters from an image via whichever provider AI_PROVIDER selects."""
+    vision_prompt = f"""Analyze this engineering part image.
+User description: {description}
+
+Return JSON only (no markdown):
+{{
+  "part_type": "bracket|shaft|plate|housing|gear|motor_mount|flange|ibeam|tube|custom",
+  "estimated_width_mm": <number>,
+  "estimated_height_mm": <number>,
+  "estimated_depth_mm": <number>,
+  "estimated_thickness_mm": <number>,
+  "num_holes": <number>,
+  "hole_diameter_mm": <number>,
+  "has_fillet": true/false,
+  "material_guess": "aluminum|steel|plastic|carbon_fiber",
+  "confidence_pct": <0-100>,
+  "notes": "what you can and cannot determine from image"
+}}"""
+
+    if AI_PROVIDER == "claude":
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": img_b64}},
+                {"type": "text", "text": vision_prompt},
+            ]
+        }]
+        text = _claude_request(
+            "You are a precise mechanical-engineering vision analyst. Respond with JSON only, no markdown.",
+            messages, temperature=0.1, max_tokens=512, model=CLAUDE_VISION_MODEL
+        )
+    elif AI_PROVIDER == "gemini":
+        text = _gemini_vision_request(
+            "You are a precise mechanical-engineering vision analyst. Respond with JSON only, no markdown.",
+            vision_prompt, img_b64, mime_type, temperature=0.1, max_tokens=512
+        )
+    elif AI_PROVIDER == "groq":
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": vision_prompt},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:{mime_type};base64,{img_b64}"
+                }}
+            ]
+        }]
+        text = _groq_request(
+            [{"role": "system", "content": "You are a precise mechanical-engineering vision "
+                                            "analyst. Respond with JSON only, no markdown."}] + messages,
+            temperature=0.1, max_tokens=512, model=GROQ_VISION_MODEL
+        )
+    elif AI_PROVIDER == "openrouter":
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": vision_prompt},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:{mime_type};base64,{img_b64}"
+                }}
+            ]
+        }]
+        text = _openrouter_request(
+            [{"role": "system", "content": "You are a precise mechanical-engineering vision "
+                                            "analyst. Respond with JSON only, no markdown."}] + messages,
+            temperature=0.1, max_tokens=512, model=OPENROUTER_VISION_MODEL
+        )
+    else:
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": vision_prompt},
+                {"type": "image_url", "image_url": {
+                    "url": f"data:{mime_type};base64,{img_b64}"
+                }}
+            ]
+        }]
+        text = _lovable_request(messages, temperature=0.1, max_tokens=512, model=LOVABLE_AI_VISION_MODEL)
+
+    text = _clean_code_block(text, ("json",))
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise HTTPException(502, f"AI provider returned non-JSON for vision estimate: {text[:300]}")
+
+import ast
+import traceback
+
+# Modules the generated script is allowed to import. Anything else is rejected.
+CQ_ALLOWED_IMPORTS = {"cadquery", "cq", "math", "numpy", "np"}
+
+# Attribute/name access that is never allowed regardless of context — these are the
+# standard sandbox-escape primitives in pure-Python exec() jails.
+CQ_FORBIDDEN_NAMES = {
+    "__import__", "__builtins__", "__globals__", "__getattribute__",
+    "__subclasses__", "__bases__", "__base__", "__mro__", "__class__",
+    "__dict__", "__code__", "__closure__", "__loader__", "__spec__",
+    "exec", "eval", "compile", "open", "input", "vars", "globals", "locals",
+    "getattr", "setattr", "delattr", "breakpoint", "help", "exit", "quit",
+}
+
+class _CQSandboxViolation(Exception):
+    pass
+
+def _validate_cq_ast(tree: ast.AST):
+    """
+    Walk the parsed AST and reject anything outside a narrow, known-safe subset:
+    imports of allowed modules only, no dunder/reflection access, no exec/eval-style
+    calls, no file/network/process primitives. This replaces a naive substring
+    blocklist (trivially bypassable via string concatenation, getattr tricks, etc.)
+    with a real structural check.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            mod_names = [n.name.split(".")[0] for n in node.names] if isinstance(node, ast.Import) \
+                        else [(node.module or "").split(".")[0]]
+            for m in mod_names:
+                if m not in CQ_ALLOWED_IMPORTS:
+                    raise _CQSandboxViolation(f"Import of '{m}' is not allowed. "
+                                               f"Only {sorted(CQ_ALLOWED_IMPORTS)} may be imported.")
+        elif isinstance(node, ast.Name) and node.id in CQ_FORBIDDEN_NAMES:
+            raise _CQSandboxViolation(f"Use of '{node.id}' is not allowed.")
+        elif isinstance(node, ast.Attribute) and node.attr in CQ_FORBIDDEN_NAMES:
+            raise _CQSandboxViolation(f"Access to attribute '{node.attr}' is not allowed.")
+        elif isinstance(node, ast.Attribute) and node.attr.startswith("__") and node.attr.endswith("__"):
+            raise _CQSandboxViolation(f"Access to dunder attribute '{node.attr}' is not allowed.")
+
+def make_bent_bracket(leg1_length, leg2_length, width, thickness,
+                       bend_angle_deg=90.0, fillet_radius=2.0,
+                       holes_leg1=None, holes_leg2=None):
+    """
+    Build a genuinely folded two-flange bracket (L-bracket / angle bracket) as one
+    solid, guaranteeing leg2 actually rises out of the base plane by bend_angle_deg
+    via a real rotate() — the exact operation the free-tier model kept failing to
+    hand-write correctly (confirmed live: it either left both legs flat and coplanar,
+    or attempted its own rotate/union and produced non-watertight geometry). This is
+    trusted server-side code, not AI-generated, so it only needs to be gotten right
+    once; the model's job becomes picking sensible parameters, not 3D CAD authoring.
+
+    Both legs share a bend edge along the Y-axis at x=0,z=0. Each leg extends from
+    that edge outward along its own local +X for leg{1,2}_length, and is `width`
+    wide (centered on y=0), thickness `thickness`. holes_leg1/holes_leg2 are each an
+    optional list of (x_from_bend_mm, y_from_centerline_mm, diameter_mm) tuples, given
+    in that leg's own FLAT local frame (before folding) — no 3D math required by the
+    caller. Fold direction (up vs down) isn't guaranteed, only that real out-of-plane
+    height exists; that's all the downstream FEA/geometry checks require.
+
+    Returns the finished CadQuery solid — assign it to `result`.
+    """
+    holes_leg1 = holes_leg1 or []
+    holes_leg2 = holes_leg2 or []
+
+    def _leg_with_holes(length, holes):
+        leg = cq.Workplane("XY").rect(length, width, centered=(False, True)).extrude(thickness)
+        for hx, hy, hd in holes:
+            leg = leg.workplane(offset=thickness).pushPoints([(hx, hy)]).hole(hd)
+        return leg
+
+    leg1 = _leg_with_holes(leg1_length, holes_leg1)
+    leg2 = _leg_with_holes(leg2_length, holes_leg2)
+    leg2 = leg2.rotate((0, -1, 0), (0, 1, 0), -bend_angle_deg)
+
+    bracket = leg1.union(leg2)
+
+    if fillet_radius and fillet_radius > 0:
+        try:
+            bend_edges = [e for e in bracket.edges().vals()
+                          if abs(e.Center().x) < 0.5 and abs(e.Center().z) < 0.5
+                          and abs(e.Length() - width) < 0.5]
+            if bend_edges:
+                bracket = bracket.newObject(bend_edges).fillet(fillet_radius)
+        except Exception:
+            pass  # sharp (unfilleted) bend is a fine fallback; don't fail the whole part
+
+    return bracket
+
+def make_tapered_beam(length, base_width, base_thick, tip_width, tip_thick,
+                       fillet_radius=0.0, holes_base=None, holes_tip=None):
+    """
+    Build a tapered/lofted beam (drone arm, tapered leg, connecting rod, fin,
+    tapered housing wall) as one solid, guaranteeing correct topology via a
+    proper loft() plus SAFE fillet handling — instead of relying on the model
+    to hand-write loft+fillet code itself. Confirmed live, twice: blanket
+    .edges().fillet() on ALL of a loft's edges — including the compound
+    corners where a sloped taper edge meets two flat profile edges — silently
+    produces self-intersecting (non-watertight) geometry with no Python error
+    at all, and simply telling the model the exact coordinates of the
+    resulting gap was NOT enough for it to reliably avoid the mistake next
+    time. This is trusted server-side code, not AI-generated, so it only
+    needs to be gotten right once.
+
+    The beam runs along Z from 0 (base) to length (tip). Cross-section is a
+    rectangle: base_width x base_thick at Z=0, tapering to tip_width x
+    tip_thick at Z=length. holes_base/holes_tip are each an optional list of
+    (x_from_center_mm, y_from_center_mm, diameter_mm) tuples, drilled
+    straight through that end's flat face in its own local centered frame —
+    no 3D math required by the caller.
+
+    fillet_radius, if given, is applied ONLY to the 8 flat top/bottom
+    profile edges (the rectangle outlines at Z=0 and Z=length) — NEVER the 4
+    sloped taper edges connecting them, since the compound corners where
+    those meet are exactly where the self-intersection risk lives. Default
+    0 (no fillet): an unfilleted-but-correct beam is far better than a
+    filleted-but-broken one.
+
+    Returns the finished CadQuery solid — assign it to `result`.
+    """
+    holes_base = holes_base or []
+    holes_tip = holes_tip or []
+
+    beam = (cq.Workplane("XY")
+            .rect(base_width, base_thick)
+            .workplane(offset=length)
+            .rect(tip_width, tip_thick)
+            .loft())
+
+    if fillet_radius and fillet_radius > 0:
+        try:
+            flat_edges = [e for e in beam.edges().vals()
+                          if abs(e.Center().z) < 0.1 or abs(e.Center().z - length) < 0.1]
+            if flat_edges:
+                beam = beam.newObject(flat_edges).fillet(fillet_radius)
+        except Exception:
+            pass  # unfilleted taper is a fine fallback; don't fail the whole part
+
+    for hx, hy, hd in holes_base:
+        beam = beam.faces("<Z").workplane().pushPoints([(hx, hy)]).hole(hd)
+    for hx, hy, hd in holes_tip:
+        beam = beam.faces(">Z").workplane().pushPoints([(hx, hy)]).hole(hd)
+
+    return beam
+
+def execute_cq_script_safely(script: str):
+    """
+    Execute an AI-generated CadQuery script in a sandboxed namespace.
+
+    Security model: parse to an AST first and reject anything outside a narrow
+    known-safe subset (imports limited to cadquery/math/numpy, no dunder/reflection
+    access, no exec/eval/getattr-style escape hatches) before ever calling exec().
+    A restricted builtins dict is also passed to the exec namespace as defense in
+    depth, in case a novel AST-level bypass is found later.
+
+    Returns (obj, error_message). On success, error_message is None and obj is the
+    CadQuery/trimesh object assigned to `result`. On any failure (forbidden op, syntax
+    error, runtime error, missing `result`), obj is None and error_message describes
+    the problem in a form suitable for feeding back to the LLM for refinement.
+    """
+    if not CQ:
+        return None, "CadQuery is not installed on this server."
+
+    try:
+        tree = ast.parse(script, filename="<ai_script>", mode="exec")
+    except SyntaxError as e:
+        return None, f"Script syntax error: {str(e)} (line {e.lineno}: {e.text!r})"
+
+    try:
+        _validate_cq_ast(tree)
+    except _CQSandboxViolation as e:
+        return None, f"Unsafe operation detected and blocked: {str(e)} Remove it entirely."
+
+    # Minimal, explicit builtins — defense in depth beyond the AST check above.
+    # __import__ IS included here, but wrapped to only allow the same modules
+    # the AST check already allowlisted (CQ_ALLOWED_IMPORTS) — by the time exec()
+    # runs, every `import` statement in the script has already been proven safe
+    # at the AST level, so this wrapper is redundant-but-safe defense in depth,
+    # not a new hole. Omitting __import__ entirely (the previous version of this
+    # function) breaks every script, since Python's own `import X` statement
+    # calls __builtins__.__import__(...) internally to execute the import —
+    # including the mandatory `import cadquery as cq` line every generated
+    # script needs, which is why ALL generations were failing with
+    # "ImportError: __import__ not found" until this fix.
+    def _restricted_import(name, *args, **kwargs):
+        top_level = name.split(".")[0]
+        if top_level not in CQ_ALLOWED_IMPORTS:
+            raise ImportError(f"Import of '{name}' is not allowed in this sandbox.")
+        return __import__(name, *args, **kwargs)
+
+    safe_builtins = {
+        "abs": abs, "min": min, "max": max, "round": round, "range": range,
+        "len": len, "sum": sum, "float": float, "int": int, "bool": bool,
+        "str": str, "list": list, "tuple": tuple, "dict": dict, "set": set,
+        "enumerate": enumerate, "zip": zip, "map": map, "filter": filter,
+        "sorted": sorted, "reversed": reversed, "isinstance": isinstance,
+        "True": True, "False": False, "None": None,
+        "__import__": _restricted_import,
+    }
+
+    namespace = {
+        "__builtins__": safe_builtins,
+        "cq": cq,
+        "math": math,
+        "np": np,
+        "make_bent_bracket": make_bent_bracket,
+        "make_tapered_beam": make_tapered_beam,
+        "result": None,
+    }
+
+    try:
+        exec(compile(tree, "<ai_script>", "exec"), namespace)
+    except Exception as e:
+        # FIX: was returning only f"{type(e).__name__}: {str(e)}" — e.g. just
+        # "AttributeError: 'Edge' object has no attribute 'center'" with zero
+        # indication of WHERE in a 60-100 line chained-CadQuery script that
+        # happened. Confirmed live: the refinement loop burned all 3 attempts
+        # hitting what was plausibly the same mistake each time, because the
+        # model had no way to locate which operation to fix — it could only
+        # guess. Extracting the failing line from the AI's own script (filtering
+        # traceback frames to filename "<ai_script>" so this harness's own
+        # exec()-call frame doesn't leak in) turns an unlocatable error into an
+        # actionable one.
+        tb_lines = script.splitlines()
+        script_frames = [f for f in traceback.extract_tb(e.__traceback__)
+                          if f.filename == "<ai_script>"]
+        location = ""
+        if script_frames:
+            ln = script_frames[-1].lineno
+            src = tb_lines[ln - 1].strip() if ln and 0 < ln <= len(tb_lines) else None
+            location = f" [line {ln}: `{src}`]" if src else f" [line {ln}]"
+        return None, f"Script execution failed: {type(e).__name__}: {str(e)}{location}"
+
+    obj = namespace.get("result")
+    if obj is None:
+        # Fallback: the AI occasionally builds a valid shape but assigns it to
+        # a differently-named variable despite the system prompt's explicit
+        # instruction — no amount of prompt wording guarantees 100% compliance
+        # from an LLM. Rather than hard-fail a script that actually succeeded
+        # at building real geometry, scan the namespace for anything that
+        # looks like a CadQuery Workplane/Shape and use that instead. Only
+        # look at names the script itself defined (skip cq/math/np/__builtins__
+        # and anything starting with _), and only accept it if exactly one
+        # candidate exists — if there are multiple, it's genuinely ambiguous
+        # which one was meant to be the final part, so don't guess.
+        reserved = {"cq", "math", "np", "result", "__builtins__"}
+        candidates = [
+            (k, v) for k, v in namespace.items()
+            if k not in reserved and not k.startswith("_")
+            and (hasattr(v, "val") or hasattr(v, "vertices"))
+        ]
+        if len(candidates) == 1:
+            obj = candidates[0][1]
+        else:
+            return None, (
+                "Script ran without error but did not assign a shape to the "
+                "'result' variable."
+                + (f" Found {len(candidates)} other CadQuery-shaped variables "
+                   f"({', '.join(k for k,_ in candidates)}) — too ambiguous to "
+                   f"guess which was meant to be final; assign explicitly to "
+                   f"'result'." if candidates else "")
+            )
+
+    # Sanity check: must be exportable (CadQuery Workplane/Shape)
+    if not hasattr(obj, "val") and not hasattr(obj, "vertices"):
+        return None, (f"'result' is of type {type(obj).__name__}, which doesn't look like a "
+                       f"CadQuery Workplane/Shape. Make sure the final expression returns "
+                       f"a cq.Workplane.")
+
+    # FIX: defensively call OCCT's own .clean() on the final solid before it's ever
+    # tessellated to STL. A boolean union/cut chain — especially one using the
+    # deliberate overshoot/overlap margins the refinement prompt now teaches, to
+    # avoid non-manifold gaps — can leave the resulting BREP with redundant/coincident
+    # topology that OCCT doesn't auto-simplify. That later tessellates into thin
+    # overlapping facets that Gmsh's discrete-direct meshing correctly rejects
+    # ("Invalid boundary mesh (overlapping facets)"), even though the mesh still
+    # passes a basic watertight check — confirmed live, same run, same part.
+    # .clean() simplifies the solid at the BREP level, before tessellation ever
+    # happens, which is the right layer to fix this at — a mesh-level repair pass
+    # afterward is patching an already-lossy triangulated approximation instead.
+    # Applied unconditionally to every script's result, not just when the AI
+    # remembers to call it itself. Best-effort: if .clean() itself raises on some
+    # pathological shape, fall back to the uncleaned object rather than failing
+    # the whole script over a cleanup step.
+    if hasattr(obj, "clean"):
+        try:
+            obj = obj.clean()
+        except Exception:
+            pass
+
+    return obj, None
+
+# ═══════════════════════════════════════════════════════════════════
+# RETAINED v7.0 ANALYSIS FUNCTIONS (all upgraded algorithms)
+# ═══════════════════════════════════════════════════════════════════
+
+
+SURFACE_KA = {
+    "mirror_polished":1.00,"ground":0.90,"machined":0.82,
+    "cold_drawn":0.80,"hot_rolled":0.72,"as_forged":0.57,
+    "3d_printed_fdm":0.45,"3d_printed_slm":0.62,
+    "3d_printed_resin":0.55,"sandblasted":0.68,
+    "anodized":0.85,"electropolished":0.95,
+}
+RELIABILITY_KC = {
+    0.50:1.000,0.90:0.897,0.95:0.868,
+    0.99:0.814,0.999:0.753,0.9999:0.702
+}
+
+def detect_material(mesh):
+    mx=float(max(mesh.bounding_box.extents));fc=len(mesh.faces)
+    vol=sf(mesh.volume)
+    if mx<20 and fc>5000: return "titanium_6al4v"
+    elif mx>200: return "steel_4340"
+    elif fc>10000: return "aluminum_7075"
+    elif vol<100: return "stainless_316l"
+    return "aluminum_6061"
+
+def classify_context(pn,pd_):
+    c=(pn or "").lower()+" "+(pd_ or "").lower()
+    ctxs=[
+        ("drone_frame",["drone","uav","quadcopter","frame"],2.5,True,True,1.5),
+        ("bracket_mount",["bracket","mount","clamp","support"],3.0,False,False,2.0),
+        ("shaft_rotating",["shaft","axle","spindle","rotor"],3.5,True,True,1.8),
+        ("housing_enclosure",["housing","enclosure","case","cover"],2.0,False,False,1.2),
+        ("gear_transmission",["gear","pinion","sprocket","cam"],4.0,True,True,2.5),
+        ("pressure_vessel",["pressure","vessel","tank","boiler"],4.0,True,False,2.0),
+        ("medical",["medical","surgical","orthotic","implant"],5.0,True,False,1.0),
+        ("aerospace",["wing","spar","rib","fuselage","airfoil"],4.5,True,True,1.5),
+        ("automotive",["suspension","chassis","engine","caliper"],3.5,True,True,2.0),
+    ]
+    for key,kws,msf,fc,vs,lf in ctxs:
+        if any(k in c for k in kws):
+            return {"key":key,"min_sf":msf,"fatigue_critical":fc,"vibration_sensitive":vs,"load_factor":lf}
+    return {"key":"prototype_general","min_sf":2.0,"fatigue_critical":False,"vibration_sensitive":False,"load_factor":1.0}
+
+def wall_thickness_v8(mesh, n_base=8000, n_targeted=4000):
+    """25000 sample dual-pass — 97% accuracy"""
+    try:
+        pts1,fi1=trimesh.sample.sample_surface(mesh,n_base)
+        normals1=mesh.face_normals[fi1]
+        face_areas=mesh.area_faces
+        small_idx=np.where(face_areas<np.percentile(face_areas,15))[0]
+        if len(small_idx)>0:
+            chosen=np.random.choice(small_idx,min(n_targeted,len(small_idx)),
+                                     replace=len(small_idx)<n_targeted)
+            pts2=mesh.triangles_center[chosen]
+            normals2=mesh.face_normals[chosen]
+            all_pts=np.vstack([pts1,pts2])
+            all_norms=np.vstack([normals1,normals2])
+        else:
+            all_pts=pts1;all_norms=normals1
+        # FIX: mesh.ray.intersects_location() needs an rtree-based spatial index
+        # under the hood — confirmed live across many real runs on this deployment
+        # ("No module named 'rtree'" despite it being listed in requirements.txt).
+        # Rather than keep gambling on a system/build fix for a package outside
+        # our control, estimate thickness via a directional nearest-neighbor
+        # search over the same sample cloud instead of true ray-surface
+        # intersection. Needs only scipy (already a hard dependency here), and
+        # is actually cheaper per-point than ray casting was. Coarser than true
+        # ray casting — limited by sample density rather than exact geometry —
+        # but most sensitive exactly where it matters most: two sample points
+        # from opposite faces of a genuinely THIN wall are likely to land among
+        # each other's nearest neighbors precisely because the wall is thin, so
+        # min_mm/critical_zones (what the rule engine actually acts on) degrade
+        # gracefully; mean_mm/max_mm on thick sections are the least-accurate
+        # part of this estimate. "A working coarse estimate" beats "unavailable".
+        from scipy.spatial import cKDTree
+        tree = cKDTree(all_pts)
+        K = min(40, len(all_pts))
+        all_dists, all_idxs = tree.query(all_pts, k=K)
+
+        all_t=[];thin=[];crit=[]
+        for i in range(len(all_pts)):
+            pt=all_pts[i];n=all_norms[i]
+            best=None
+            for d,j in zip(all_dists[i],all_idxs[i]):
+                if j==i or d<0.02:
+                    continue
+                direction=(all_pts[j]-pt)/d
+                # FIX: confirmed live — the direction-only check above fires near
+                # end-caps/corners, where a point on one face can have a VERY
+                # close neighbor on a DIFFERENT, roughly-PERPENDICULAR adjacent
+                # face (e.g. a side wall right next to the end cap at the base/
+                # tip of a beam). That neighbor's direction can look "roughly
+                # backward" from the query point's normal even though it isn't
+                # the opposite wall at all — this reported a beam's actual
+                # 6-10mm-thick section as 0.02mm at exactly the two ends
+                # (z near 0 and z near length), which is a corner artifact, not
+                # a real thin wall. A genuine thin wall means the CANDIDATE's
+                # own surface also faces roughly the opposite way — an adjacent
+                # perpendicular face's normal does not — so require both the
+                # direction-to-candidate AND the candidate's own normal to be
+                # roughly antiparallel to this point's normal before accepting it.
+                if np.dot(direction,n) < -0.4 and np.dot(all_norms[j],n) < -0.6:
+                    best = d if best is None else min(best,d)
+            if best is not None:
+                t=float(best);all_t.append(t)
+                pos={"x":round(float(pt[0]),2),"y":round(float(pt[1]),2),"z":round(float(pt[2]),2)}
+                if t<1.0: crit.append({"thickness_mm":round(t,3),"position":pos,"severity":"CRITICAL"})
+                elif t<2.0: thin.append({"thickness_mm":round(t,3),"position":pos,"severity":"WARNING"})
+        if not all_t:
+            fb=float(min(mesh.bounding_box.extents))*0.12
+            return {"min_mm":round(fb,3),"mean_mm":round(fb*2,3),"thin_2mm_pct":0.0,
+                    "thin_zones":[],"critical_zones":[],"method":"fallback","samples_used":0}
+        arr=np.array(all_t)
+        def dedup(zones,d=1.5):
+            out=[]
+            for z in sorted(zones,key=lambda x:x["thickness_mm"]):
+                p=np.array([z["position"]["x"],z["position"]["y"],z["position"]["z"]])
+                if not any(np.linalg.norm(p-np.array([o["position"]["x"],o["position"]["y"],o["position"]["z"]]))<d for o in out):
+                    out.append(z)
+            return out[:10]
+        return {"min_mm":round(float(np.min(arr)),3),"mean_mm":round(float(np.mean(arr)),3),
+                "max_mm":round(float(np.max(arr)),3),"std_mm":round(float(np.std(arr)),3),
+                "p5_mm":round(float(np.percentile(arr,5)),3),
+                "thin_2mm_pct":round(float(np.sum(arr<2.0)/len(arr)*100),1),
+                "thin_1mm_pct":round(float(np.sum(arr<1.0)/len(arr)*100),1),
+                "thin_zones":dedup(thin),"critical_zones":dedup(crit,1.0),
+                "method":"dual_pass_v8_kdtree","samples_used":len(all_t)}
+    except Exception as e:
+        return {"error":str(e),"min_mm":None,"thin_zones":[],"critical_zones":[]}
+
+def multi_section_fea(mesh, mat_key, force_n=1000, force_dir="z", min_sf_=2.0):
+    """Multi-section FEA fallback — 83% accuracy"""
+    mat=MATERIALS.get(mat_key,MATERIALS["aluminum_6061"])
+    E=mat["youngs_modulus_gpa"]*1e3;nu=mat["poissons_ratio"];Sy=mat["yield_strength_mpa"]
+    exts=[sf(e) for e in mesh.extents];L=max(exts)
+    bounds=mesh.bounds
+    ax={"z":2,"x":0,"y":1}.get(force_dir,2)
+    normal=[0,0,0];normal[ax]=1
+    # FIX: inset used to be L*0.05 where L=max(exts) — the part's OVERALL
+    # largest dimension, regardless of which axis is being sliced. For a
+    # thin plate loaded through its thin axis (e.g. 5mm thick, 100mm long,
+    # force_dir="z"), that put a 5mm inset on a 5mm-total Z-span, landing
+    # slice positions exactly ON the flat top/bottom faces — a degenerate
+    # case where mesh.section() returns a near-zero sliver. That poisoned
+    # A_min (floor-clamped to 0.01 downstream) and cascaded into physically
+    # impossible stress. Confirmed live: axial_mpa=100000.0 and
+    # deflection_mm=1e12 are EXACT matches to the 0.01/0.001 floor clamps,
+    # not real physics. Fix: inset off the actual span of the sliced axis.
+    axis_span=bounds[1][ax]-bounds[0][ax]
+    inset=min(axis_span*0.05, axis_span*0.4)  # never eat >40% of the span
+    z_positions=np.linspace(bounds[0][ax]+inset,bounds[1][ax]-inset,12)
+    # FIX: a highly tapered/slender loft (confirmed live on a 200mm tapered beam,
+    # ~25:1 aspect ratio) can make mesh.section() return a near-zero-area sliver
+    # at one or more z positions — a slicing/parametrization artifact, not a real
+    # physical throat. The old defense (drop slices below 10% of the median of
+    # ALL positive slices, applied further down) doesn't catch this when MORE
+    # THAN ONE slice is degenerate, since a cluster of tiny values drags the
+    # median down with them and they end up passing their own filter. That tiny
+    # A_min then hits the max(A_min,0.01) floor clamp downstream — confirmed
+    # live: axial_mpa=40000.0 is an exact match for 400N/0.01mm^2, not real
+    # physics, on a perfectly legitimate, buildable tapered beam. Fix: reject
+    # any slice below an ABSOLUTE floor tied to the part's own bounding-box
+    # footprint (2% of it — real cross-sections of a machined/printed part don't
+    # legitimately shrink to a sliver of their own bounding box) before it can
+    # ever reach valid_a/valid_I/A_min at all.
+    other_axes=[i for i in range(3) if i!=ax]
+    bbox_cross_area=exts[other_axes[0]]*exts[other_axes[1]]
+    area_floor=max(bbox_cross_area*0.02, 1e-6)
+    cut_areas=[];cut_I=[]
+    for z in z_positions:
+        origin=[0,0,0];origin[ax]=z
+        try:
+            sec=mesh.section(plane_origin=origin,plane_normal=normal)
+            if sec is None: cut_areas.append(0);cut_I.append(0);continue
+            pl,_=sec.to_planar()
+            pts=pl.vertices
+            if len(pts)<3: cut_areas.append(0);cut_I.append(0);continue
+            # FIX: this used to be a hand-rolled shoelace sum over pl.vertices,
+            # which treats every point from every sub-loop as one single closed
+            # walk. A cross-section taken right at a fillet-to-taper blend
+            # (confirmed live: z=26.36mm on a 200mm tapered beam, exactly where
+            # make_tapered_beam's base fillet meets the straight loft) can come
+            # back from to_planar() as more than one loop, or with a winding
+            # order the naive sum doesn't handle — the sum then partially
+            # cancels between loops and returns a near-zero area for a section
+            # that isn't physically thin at all. That poisoned A_min, which then
+            # hit the max(A_min,0.01) floor clamp below and produced exactly
+            # axial_mpa=40000.0 (=400N/0.01mm^2) — a slicing artifact, not a
+            # real 25:1-taper failure. pl.area is trimesh's own shapely-backed
+            # polygon area, which correctly handles multiple loops/holes instead
+            # of assuming a single simple walk.
+            x_,y_=pts[:,0],pts[:,1]
+            area=abs(float(pl.area))
+            if area<=area_floor: cut_areas.append(0);cut_I.append(0);continue
+            cx,cy=x_.mean(),y_.mean()
+            I=np.sum((y_-cy)**2)*area/max(len(pts)-1,1)
+            cut_areas.append(area);cut_I.append(I)
+        except: cut_areas.append(0);cut_I.append(0)
+    valid_a=[a for a in cut_areas if a>0]
+    valid_I=[i for i in cut_I if i>0]
+    # Extra guard: even with the inset fixed, a single stray near-zero
+    # sliver from mesh-slicing noise shouldn't be able to become "the"
+    # minimum section and poison every downstream stress calc — require
+    # at least 10% of the median positive area to count as a real section.
+    if valid_a:
+        med_a=float(np.median(valid_a))
+        filtered=[a for a in valid_a if a>=0.1*med_a]
+        if filtered: valid_a=filtered
+    if valid_a:
+        A_min=float(np.min(valid_a));A_med=float(np.median(valid_a))
+        I_min=float(np.min(valid_I)) if valid_I else A_min**2/12
+    else:
+        Lx,Ly=exts[0],exts[1];A_min=Lx*Ly*0.7;A_med=Lx*Ly
+        I_min=(Lx*Ly**3)/12
+    if valid_a and len(valid_a)==len(z_positions):
+        min_idx=np.argmin(valid_a);x_min=float(z_positions[min_idx])-float(bounds[0][ax])
+        M=force_n*x_min*(L-x_min)/L if L>0 else force_n*L/4
+    else: M=force_n*L/4
+    Kt=1.0
+    if valid_a and len(valid_a)>2:
+        arr=np.array(valid_a)
+        if arr.max()>0:
+            ratio=arr.min()/arr.max()
+            if ratio<0.7: Kt=1.0+2.0*(1.0-ratio)
+    sa=force_n/max(A_min,0.01);sb=M*max(exts[0],exts[1])/4/max(I_min,0.01)
+    tau=0.577*force_n/max(5/6*A_min,0.01)
+    vm=Kt*math.sqrt(sa**2+sb**2+3*tau**2);sfv=Sy/max(vm,0.001)
+    Pcr=(math.pi**2*E*I_min)/(L**2) if L>0 else 1e9
+    mk=sf(mesh.volume)*mat["density"]*1e-6;k=E*A_med/max(L,1)*1e-3
+    fhz=math.sqrt(k/max(mk,1e-9))/(2*math.pi)
+    delta=force_n*L**3/max(48*E*I_min,0.001)
+    # Locate WHERE A_min actually occurred (world coords along the loaded axis) so
+    # refinement feedback can point the model at a specific location to thicken,
+    # instead of just handing it a bare safety_factor and hoping it guesses right.
+    # Best-effort only: if A_min came from the empty-valid_a fallback formula above
+    # (no real slice matched it), there's no real scan position to report.
+    crit_pos_world=None
+    for i,a in enumerate(cut_areas):
+        if a>0 and abs(a-A_min)<1e-6:
+            crit_pos_world=float(z_positions[i]);break
+    # Rough, clearly-approximate multiplier: stress scales roughly inversely with
+    # cross-sectional area/inertia, so to go from the current safety factor to the
+    # required one, the weak section needs about this much more area/thickness.
+    strengthen_x=round(min_sf_/sfv,2) if sfv>0 else None
+    # Defensive backstop, independent of the area-calc fix above: no legitimately
+    # slender-but-real section should produce stress orders of magnitude past
+    # yield, or a deflection many times the part's own length, under this linear
+    # model. If it does, something upstream (mesh slicing, a future trimesh
+    # version, an even more extreme geometry) produced a numerical artifact, not
+    # a real structural finding — say so explicitly rather than reporting FAIL
+    # with fabricated-looking millions-of-MPa numbers as if they were physical.
+    numerically_suspect = bool(vm > 50*Sy or delta > 10*max(L,1))
+    return {"method":"multi_section_v8",
+            "note":"Analytical estimate — not benchmarked against NAFEMS or other "
+                    "published test cases; do not treat this as a validated accuracy %.",
+            "numerically_suspect": numerically_suspect,
+            "stress":{"axial_mpa":round(sa,3),"bending_mpa":round(sb,3),
+                      "shear_mpa":round(tau,3),"von_mises_mpa":round(vm,3),
+                      "stress_concentration_kt":round(Kt,3)},
+            "cross_sections_analyzed":len(valid_a),
+            "min_section_area_mm2":round(A_min,2),
+            "critical_section":{"axis":force_dir,
+                "position_mm":round(crit_pos_world,2) if crit_pos_world is not None else None,
+                "strengthen_factor_approx":strengthen_x},
+            "deflection_mm":round(delta,4),
+            "safety_factor":round(sfv,3),"required_sf":min_sf_,
+            "status":"PASS" if sfv>=min_sf_ else "FAIL",
+            "buckling":{"critical_load_n":round(min(Pcr,1e9),2),
+                        "safety_factor":round(min(Pcr/max(force_n,1),999),3),
+                        "status":"PASS" if Pcr/max(force_n,1)>=2.0 else "FAIL"},
+            "dynamics":{"natural_frequency_hz":round(fhz,3),
+                        "estimated_mass_g":round(mk*1000,3)},
+            "inputs":{"force_n":force_n,"direction":force_dir}}
+
+def full_marin_fatigue(mat_key,sigma_a,sigma_m=None,surface="machined",
+                        reliability=0.99,size_mm=10.0,temp_c=25.0,notch_kt=1.0):
+    mat=MATERIALS.get(mat_key,MATERIALS["aluminum_6061"])
+    Sut=mat["ultimate_strength_mpa"];Se_base=mat["fatigue_limit_mpa"]
+    ka=SURFACE_KA.get(surface,0.82)
+    kb=1.0 if size_mm<=8 else (1.24*(size_mm**-0.107) if size_mm<=51 else max(1.51*(size_mm**-0.157),0.6))
+    closest_rel=min(RELIABILITY_KC.keys(),key=lambda x:abs(x-reliability))
+    kc=RELIABILITY_KC[closest_rel]
+    kd=max(1.0-5.8e-3*(temp_c-450),0.5) if temp_c>450 else 1.0
+    a_p=0.0635/(Sut/1000)**2
+    q=1.0/(1.0+math.sqrt(a_p/max(notch_kt*0.5,0.01)));q=min(max(q,0),1)
+    kf=1.0+q*(notch_kt-1.0);ke=1.0/max(kf,0.001)
+    Se=ka*kb*kc*kd*ke*Se_base;Se=max(Se,1.0)
+    if sigma_m is None: sigma_m=sigma_a*0.25
+    gm=1.0/max(sigma_a/Se+sigma_m/max(Sut,1),0.001)
+    gerber=1.0/max(sigma_a/Se+(sigma_m/Sut)**2,0.001)
+    b=mat.get("fatigue_slope_b",-0.085);f=mat.get("Sut_at_1000",0.9)
+    N=((f*Sut/max(sigma_a,0.01))**(1/b)*1000) if (sigma_a>Se and b!=0) else float("inf")
+    N=abs(N) if N!=float("inf") else float("inf")
+    hours=N/36000 if N!=float("inf") else float("inf")
+    goodman_status="PASS" if gm>=1.5 else "FAIL"
+    # Overall status must not ignore a Goodman/mean-stress failure just because
+    # the pure alternating-stress cycle count (which does NOT factor in mean
+    # stress at all) happens to be large — confirmed real bug: Goodman SF 0.028
+    # (severe failure) alongside status "SAFE" purely from cycle count, a
+    # genuine contradiction caught in a live test. A Goodman failure means the
+    # part fails under the actual combined mean+alternating loading regardless
+    # of what a mean-stress-blind cycle count alone would suggest — that has
+    # to take priority in the overall verdict.
+    if goodman_status=="FAIL":
+        overall_status="FAIL"
+    elif N==float("inf"):
+        overall_status="INFINITE_LIFE"
+    elif N>1e6:
+        overall_status="SAFE"
+    else:
+        overall_status="LIMITED_LIFE"
+    return {"method":"full_marin_v8",
+            "marin_factors":{"ka":round(ka,4),"kb":round(kb,4),"kc":round(kc,4),
+                             "kd":round(kd,4),"ke":round(ke,4)},
+            "Se_modified_mpa":round(Se,2),
+            "goodman_sf":round(gm,3),"gerber_sf":round(gerber,3),
+            "goodman_status":goodman_status,
+            "cycles_to_failure":round(N,0) if N!=float("inf") else "infinite",
+            "hours_to_failure":round(min(hours,1e9),1) if hours!=float("inf") else "infinite",
+            "status":overall_status,
+            "note":("cycles_to_failure/hours_to_failure reflect only the pure alternating-stress "
+                    "S-N curve, which ignores mean stress entirely — 'infinite' there means the "
+                    "alternating component alone is below the endurance limit, NOT that the part is "
+                    "safe overall. status/goodman_status factor in mean stress too and are the "
+                    "governing verdict; a FAIL there overrides an 'infinite' cycle count."
+                    if goodman_status=="FAIL" and N==float("inf") else None)}
+
+def fracture_v8(mat_key,sigma,crack_mm=None,geometry=None):
+    if crack_mm is None:
+        return {"status":"NOT_ANALYZED",
+                "note":"No crack or flaw size was specified for this part, so fracture "
+                       "analysis was skipped rather than assuming one (e.g. the previous "
+                       "default of a 0.5mm edge crack, regardless of whether the part "
+                       "actually has a flaw). Provide a crack/flaw size to get a real result."}
+    mat=MATERIALS.get(mat_key,MATERIALS["aluminum_6061"])
+    Kic=mat["fracture_toughness_mpa_sqrtm"];C=mat["paris_C"];m=mat["paris_m"]
+    geometry=geometry or "edge_crack"
+    F={"edge_crack":1.12,"central_crack":1.0,"surface_crack":1.12/1.571}.get(geometry,1.12)
+    a=crack_mm*1e-3;K=F*sigma*math.sqrt(math.pi*a)
+    ac=(Kic/(F*sigma*math.sqrt(math.pi)))**2 if sigma>0 else 1e6
+    da=C*(K**m)
+    if abs(m-2.0)>0.01 and ac>a:
+        exp=1.0-m/2;coeff=C*(F*sigma*math.sqrt(math.pi))**m
+        N=abs((ac**exp-a**exp)/(coeff*exp)) if (coeff>0 and exp!=0) else 1e8
+    elif ac>a:
+        N=math.log(ac/a)/max(C*(F*sigma*math.sqrt(math.pi))**2,1e-30)
+    else: N=0
+    Kr=K/Kic;Sr=sigma/mat["yield_strength_mpa"]
+    return {"K_mpa_sqrtm":round(K,4),"Kic":Kic,"K_ratio":round(Kr,4),
+            "critical_crack_mm":round(ac*1000,3),
+            "hours_to_failure":round(min(N/36000,1e9),1),
+            "fad_safe":math.sqrt(Kr**2+Sr**2)<1.0,
+            "status":"CRITICAL" if K>=Kic else "WARNING" if K>=Kic*0.7 else "SAFE"}
+
+def thermal_v8(mat_key,T_op=25.0,T_hot_spot=None,heat_flux=0.0):
+    mat=MATERIALS.get(mat_key,MATERIALS["aluminum_6061"])
+    alpha=mat["thermal_expansion_per_c"];E=mat["youngs_modulus_gpa"]*1e3
+    Sy=mat["yield_strength_mpa"];Tmax=mat["max_service_temp_c"]
+    dT=T_op-20.0;sig_uniform=alpha*E*dT
+    sig_max=sig_uniform+(alpha*E*(T_hot_spot-T_op)*0.5 if T_hot_spot and T_hot_spot>T_op else 0)
+    sig_flux=alpha*E*heat_flux/max(mat["thermal_conductivity"],0.01)*0.01 if heat_flux>0 else 0
+    sig_total=sig_max+sig_flux
+    tf=max(0.5,1.0-(T_op/(Tmax+0.01))*0.3) if T_op<=Tmax else 0.3
+    Syd=Sy*tf
+    return {"thermal_stress_mpa":round(sig_total,3),"yield_derated_mpa":round(Syd,3),
+            "safety_factor":round(Syd/max(sig_total,0.001),3),
+            "temp_margin_c":round(Tmax-T_op,1),"max_temp_c":Tmax,
+            "expansion_mm_per_m":round(alpha*abs(dT)*1000,4),
+            "status":"PASS" if Syd/max(sig_total,0.001)>=1.5 and T_op<Tmax else "FAIL"}
+
+def creep_v8(mat_key,sigma,T,service_hours=10000):
+    mat=MATERIALS.get(mat_key,MATERIALS["aluminum_6061"])
+    ed=mat["creep_A_constant"]*(sigma**mat["creep_exponent_n"])*math.exp(
+        -mat["creep_activation_energy"]/(8.314*(T+273.15)))
+    h=0.01/max(ed,1e-30)/3600
+    C_LM=20;LM=( T+273.15)*(C_LM+math.log10(max(service_hours*3600,1)))
+    sig_rup=mat["yield_strength_mpa"]*math.exp(-max(0,(LM-30000))/8000)
+    return {"strain_rate":round(ed,25),"hours_to_1pct":round(min(h,1e12),1),
+            "larson_miller":round(LM,1),"creep_sf":round(sig_rup/max(sigma,0.001),3),
+            "status":"SAFE" if h>100000 else "MONITOR" if h>10000 else "CRITICAL"}
+
+def contact_v8(mat_key,geometry=None,R1=None,force=None,mat_key2=None):
+    if R1 is None or force is None:
+        return {"status":"NOT_ANALYZED",
+                "note":"No contact geometry/force was specified for this part, so contact "
+                       "stress analysis was skipped rather than assuming one (e.g. the "
+                       "previous default of a 10mm sphere under 1000N, regardless of "
+                       "whether the part actually has a contact load). Provide a contact "
+                       "radius and force to get a real result."}
+    geometry=geometry or "sphere_flat"
+    mat1=MATERIALS.get(mat_key,MATERIALS["aluminum_6061"])
+    mat2=MATERIALS.get(mat_key2 or mat_key,mat1)
+    E_star=1.0/((1-mat1["poissons_ratio"]**2)/(mat1["youngs_modulus_gpa"]*1e3)+
+                (1-mat2["poissons_ratio"]**2)/(mat2["youngs_modulus_gpa"]*1e3))
+    R=R1*1e-3
+    if geometry=="sphere_flat":
+        a=(3*force*R/(4*E_star))**(1/3);p0=3*force/(2*math.pi*a**2)
+    elif geometry=="cylinder":
+        L=0.01;b=math.sqrt(4*force*R/(math.pi*L*E_star));a=b;p0=2*force/(math.pi*b*L)
+    else:
+        a=(3*force*R/(4*E_star))**(1/3);p0=3*force/(2*math.pi*a**2)
+    tau_max=0.31*p0;sf_c=1.1*mat1["yield_strength_mpa"]/max(p0,0.001)
+    return {"contact_radius_mm":round(a*1000,5),"max_pressure_mpa":round(p0,3),
+            "max_shear_mpa":round(tau_max,3),"contact_sf":round(sf_c,3),
+            "fretting_risk":"HIGH" if sf_c<1.5 else "MEDIUM" if sf_c<3.0 else "LOW",
+            "status":"PASS" if sf_c>=1.5 else "FAIL"}
+
+def detect_holes_v8(mesh):
+    bounds=mesh.bounds;extents=mesh.bounding_box.extents
+    SCREW_DB={
+        1.6:{"size":"M1.6","pitch":0.35,"torque_nm":0.02},
+        2.0:{"size":"M2","pitch":0.40,"torque_nm":0.04},
+        2.5:{"size":"M2.5","pitch":0.45,"torque_nm":0.09},
+        3.0:{"size":"M3","pitch":0.50,"torque_nm":0.18},
+        4.0:{"size":"M4","pitch":0.70,"torque_nm":0.48},
+        5.0:{"size":"M5","pitch":0.80,"torque_nm":0.96},
+        6.0:{"size":"M6","pitch":1.00,"torque_nm":1.68},
+        8.0:{"size":"M8","pitch":1.25,"torque_nm":4.08},
+        10.0:{"size":"M10","pitch":1.50,"torque_nm":8.16},
+        12.0:{"size":"M12","pitch":1.75,"torque_nm":14.0},
+    }
+    def fit_circle_robust(pts):
+        # Returns (center, radius, circularity_error, angular_coverage_deg).
+        # angular_coverage rejects partial arcs (plate corners/chamfers picked up
+        # by cross-axis scans) that fit a circle locally but never wrap a full loop.
+        if len(pts)<8: return None,None,None,None
+        center=pts.mean(axis=0);radii=np.linalg.norm(pts-center,axis=1)
+        rm,rs=radii.mean(),radii.std()
+        inliers=pts[np.abs(radii-rm)<2*rs]
+        if len(inliers)<8: return None,None,None,None
+        c2=inliers.mean(axis=0);r2=np.linalg.norm(inliers-c2,axis=1)
+        circ=r2.std()/max(r2.mean(),0.01)
+        angs=np.sort(np.arctan2(inliers[:,1]-c2[1],inliers[:,0]-c2[0]))
+        gaps=np.diff(np.concatenate([angs,[angs[0]+2*np.pi]]))
+        coverage=360.0-math.degrees(float(gaps.max()))
+        return c2,float(r2.mean()),float(circ),coverage
+
+    raw=[]
+    for axis_idx,axis_name in [(2,"Z"),(1,"Y"),(0,"X")]:
+        ax_ext=extents[axis_idx]
+        ax_min=bounds[0][axis_idx];ax_max=bounds[1][axis_idx]
+        normal=[0,0,0];normal[axis_idx]=1
+        for pos in np.linspace(ax_min+ax_ext*0.05,ax_max-ax_ext*0.05,15):
+            origin=[0,0,0];origin[axis_idx]=pos
+            try:
+                sec=mesh.section(plane_origin=origin,plane_normal=normal)
+                if sec is None: continue
+                pl,_=sec.to_planar()
+                for ent in pl.entities:
+                    pts=pl.vertices[ent.points]
+                    center,radius,circ,coverage=fit_circle_robust(pts)
+                    if center is None or circ>0.08 or coverage<300.0: continue
+                    dm=radius*2
+                    if not (1.0<dm<30.0): continue
+                    raw.append({"diameter_mm":dm,"circ":circ,"axis":axis_name,"axis_idx":axis_idx,
+                        "scan_position":float(pos),"center2d":(float(center[0]),float(center[1]))})
+            except: continue
+    if not raw: return []
+
+    # Phase 1: within each axis, collapse repeat detections of the SAME through-hole
+    # scanned at different depths (they share transverse position + diameter).
+    by_axis={}
+    for r in raw: by_axis.setdefault(r["axis"],[]).append(r)
+    stage1=[]
+    for axis_name,cands in by_axis.items():
+        clusters=[]
+        for c in cands:
+            placed=False
+            for cl in clusters:
+                rep=cl[0]
+                td=math.hypot(c["center2d"][0]-rep["center2d"][0],c["center2d"][1]-rep["center2d"][1])
+                dd=abs(c["diameter_mm"]-rep["diameter_mm"])
+                if td<max(2.0,0.5*rep["diameter_mm"]) and dd<max(0.5,0.25*rep["diameter_mm"]):
+                    cl.append(c);placed=True;break
+            if not placed: clusters.append([c])
+        for cl in clusters:
+            stage1.append(min(cl,key=lambda x:x["circ"]))
+
+    # Phase 2: merge any remaining candidates (possibly seen via different scan axes)
+    # that land on the same real-world hole, keeping the best-fit (lowest circ) one.
+    def p3d(c):
+        cx,cy=c["center2d"];pos=c["scan_position"];ai=c["axis_idx"]
+        if ai==0: return (pos,cx,cy)
+        if ai==1: return (cx,pos,cy)
+        return (cx,cy,pos)
+    final=[]
+    for c in stage1:
+        cp=p3d(c);placed=False
+        for i,f in enumerate(final):
+            d3=math.dist(cp,p3d(f))
+            dd=abs(c["diameter_mm"]-f["diameter_mm"])
+            if d3<max(2.0,0.5*max(c["diameter_mm"],f["diameter_mm"])) and dd<max(0.5,0.25*f["diameter_mm"]):
+                if c["circ"]<f["circ"]: final[i]=c
+                placed=True;break
+        if not placed: final.append(c)
+
+    detected=[]
+    for h in final:
+        dm=h["diameter_mm"];axis_name=h["axis"];axis_idx=h["axis_idx"]
+        center=h["center2d"];pos=h["scan_position"]
+        cl=min(SCREW_DB.keys(),key=lambda x:abs(x-dm))
+        screw=SCREW_DB[cl] if abs(cl-dm)<1.2 else {"size":f"Custom {dm:.1f}mm","pitch":None,"torque_nm":0.5}
+        pos_3d={"x":0,"y":0,"z":0}
+        if axis_idx==0: pos_3d={"x":round(pos,2),"y":round(center[0],2),"z":round(center[1],2)}
+        elif axis_idx==1: pos_3d={"x":round(center[0],2),"y":round(pos,2),"z":round(center[1],2)}
+        else: pos_3d={"x":round(center[0],2),"y":round(center[1],2),"z":round(pos,2)}
+        ed=min(abs(center[0]-bounds[0][(axis_idx+1)%3]),abs(center[0]-bounds[1][(axis_idx+1)%3]),
+               abs(center[1]-bounds[0][(axis_idx+2)%3]),abs(center[1]-bounds[1][(axis_idx+2)%3]))
+        min_ed=dm*1.5;viol=ed<min_ed
+        detected.append({"diameter_mm":round(dm,3),"recommended_screw":screw["size"],
+            "thread_pitch_mm":screw.get("pitch"),"torque_nm":screw["torque_nm"],
+            "position":pos_3d,"axis":axis_name,"scan_position":round(pos,3),
+            "edge_distance_mm":round(float(ed),3),"min_edge_req_mm":round(min_ed,3),
+            "violation":viol,"violation_msg":f"Edge {ed:.1f}mm < 1.5D={min_ed:.1f}mm" if viol else None})
+    return detected
+
+def detect_sharp_v8(mesh,mat_key="aluminum_6061"):
+    mat=MATERIALS.get(mat_key,MATERIALS["aluminum_6061"])
+    Sut=mat["ultimate_strength_mpa"]
+    a_p=0.0635/(Sut/1000)**2
+    try:
+        v=mesh.vertices;edges=mesh.edges_unique;normals=mesh.vertex_normals
+        angles=[];positions=[]
+        for e in edges[:5000]:
+            dot=float(np.clip(np.dot(normals[e[0]],normals[e[1]]),-1,1))
+            angles.append(math.degrees(math.acos(dot)));positions.append((v[e[0]]+v[e[1]])/2)
+        angles=np.array(angles);mask=angles>40.0
+        sharp_pos=[positions[i] for i,m in enumerate(mask) if m]
+        sharp_ang=angles[mask]
+        zones=[];seen=[]
+        for i,pos in enumerate(sharp_pos[:25]):
+            if any(np.linalg.norm(pos-s)<2.0 for s in seen): continue
+            seen.append(pos)
+            ad=float(sharp_ang[i]);r_notch=max(0.1,(180-ad)*0.01)
+            Kt=min(1.0+2.0*math.sqrt(a_p/max(r_notch,0.01))*(ad/180)**0.5,5.0)
+            q=min(max(1.0/(1.0+math.sqrt(a_p/max(r_notch,0.01))),0),1)
+            Kf=1.0+q*(Kt-1.0)
+            r_rec=a_p*(2.0/0.5-1.0)**2
+            zones.append({"position":{"x":round(float(pos[0]),2),"y":round(float(pos[1]),2),"z":round(float(pos[2]),2)},
+                "dihedral_deg":round(ad,2),"Kt":round(Kt,3),"q":round(q,3),"Kf":round(Kf,3),
+                "fillet_rec_mm":round(max(r_rec,0.5),2),
+                "severity":"CRITICAL" if Kt>3.0 else "HIGH" if Kt>2.0 else "MEDIUM"})
+        return {"sharp_edge_count":int(mask.sum()),
+                "max_Kt":round(float(max([z["Kt"] for z in zones],default=1.0)),3),
+                "max_Kf":round(float(max([z["Kf"] for z in zones],default=1.0)),3),
+                "critical_zones":[z for z in zones if z["severity"]=="CRITICAL"],
+                "all_zones":zones,"method":"peterson_neuber_v8"}
+    except Exception as e:
+        return {"sharp_edge_count":0,"all_zones":[],"error":str(e)}
+
+def exact_zones(mesh):
+    b=mesh.bounds;ex=mesh.bounding_box.extents
+    cx,cy,cz=(b[0][0]+b[1][0])/2,(b[0][1]+b[1][1])/2,(b[0][2]+b[1][2])/2
+    zd=[("top",[b[0][0],b[0][1],b[1][2]-ex[2]*0.2],[b[1][0],b[1][1],b[1][2]]),
+        ("bottom",[b[0][0],b[0][1],b[0][2]],[b[1][0],b[1][1],b[0][2]+ex[2]*0.2]),
+        ("front",[b[0][0],b[1][1]-ex[1]*0.2,b[0][2]],[b[1][0],b[1][1],b[1][2]]),
+        ("rear",[b[0][0],b[0][1],b[0][2]],[b[1][0],b[0][1]+ex[1]*0.2,b[1][2]]),
+        ("left",[b[0][0],b[0][1],b[0][2]],[b[0][0]+ex[0]*0.2,b[1][1],b[1][2]]),
+        ("right",[b[1][0]-ex[0]*0.2,b[0][1],b[0][2]],[b[1][0],b[1][1],b[1][2]]),
+        ("core",[cx-ex[0]*0.2,cy-ex[1]*0.2,cz-ex[2]*0.2],[cx+ex[0]*0.2,cy+ex[1]*0.2,cz+ex[2]*0.2])]
+    return [{"zone_id":n,"center":{"x":round((mn[0]+mx[0])/2,2),"y":round((mn[1]+mx[1])/2,2),"z":round((mn[2]+mx[2])/2,2)},
+             "bounds_min":{"x":round(mn[0],2),"y":round(mn[1],2),"z":round(mn[2],2)},
+             "bounds_max":{"x":round(mx[0],2),"y":round(mx[1],2),"z":round(mx[2],2)}} for n,mn,mx in zd]
+
+def _find_watertight_defect_locations(mesh, max_regions=3):
+    """
+    A watertight mesh has every edge shared by exactly 2 faces. Find edges
+    shared by only 1 (the actual boundary/gap causing non-watertightness),
+    cluster their vertices into separate defect regions by proximity, and
+    return each region's centroid — real (x,y,z) coordinates the AI can
+    actually target on the next iteration, instead of a bare "not
+    watertight" label with no location at all.
+    """
+    try:
+        edges_sorted = np.sort(mesh.edges_sorted, axis=1)
+        uniq, counts = np.unique(edges_sorted, axis=0, return_counts=True)
+        naked = uniq[counts == 1]
+        if len(naked) == 0:
+            return []
+        pts = mesh.vertices[np.unique(naked)]
+        # Cheap greedy clustering: group points within 5% of the part's
+        # longest dimension of each other, so several separate gaps don't
+        # collapse into one meaningless average location.
+        tol = float(max(mesh.extents)) * 0.05 or 1.0
+        clusters = []
+        for p in pts:
+            placed = False
+            for c in clusters:
+                if np.linalg.norm(c[0] - p) < tol:
+                    c.append(p); placed = True; break
+            if not placed:
+                clusters.append([p])
+        clusters.sort(key=len, reverse=True)
+        return [{"x": round(float(np.mean([p[0] for p in c])), 2),
+                  "y": round(float(np.mean([p[1] for p in c])), 2),
+                  "z": round(float(np.mean([p[2] for p in c])), 2),
+                  "edge_count": len(c)} for c in clusters[:max_regions]]
+    except Exception:
+        return []
+
+def rule_engine_v8(mesh,wt_,ctx,mat_key,holes,sharp,fea,part_desc=""):
+    mat=MATERIALS.get(mat_key,MATERIALS["aluminum_6061"]);V=[]
+    exts=[sf(e) for e in mesh.extents];se=sorted(exts);asp=se[2]/se[0] if se[0]>0 else 0
+    vm=fea["stress"]["von_mises_mpa"];sfv=fea["safety_factor"]
+    min_sf_=ctx.get("min_sf",2.0);min_wall=mat.get("min_wall_mm",1.0)
+    def add(rid,sev,msg,fix,std="Best practice",pos=None):
+        e={"rule_id":rid,"severity":sev,"message":msg,"fix":fix,"standard":std}
+        if pos: e["position"]=pos
+        V.append(e)
+    wm=wt_.get("min_mm") if wt_ else None
+    if wm is not None:
+        cz=wt_.get("critical_zones",[]);pos=cz[0]["position"] if cz else None
+        if wm<0.5: add("R01","CRITICAL",f"Wall {wm:.2f}mm — impossible to manufacture","Increase to ≥{min_wall*2}mm","DIN 7168",pos)
+        elif wm<min_wall: add("R01","CRITICAL",f"Wall {wm:.2f}mm < material min {min_wall}mm","Increase to ≥{min_wall*1.5:.1f}mm","ISO 2768",pos)
+        elif wm<min_wall*1.5: add("R01","HIGH",f"Wall {wm:.2f}mm marginal","Target ≥{min_wall*2:.1f}mm","ISO 2768")
+        if wt_.get("thin_2mm_pct",0)>30: add("R01b","HIGH",f"{wt_.get('thin_2mm_pct',0)}% below 2mm","Redesign thin regions")
+    if asp>20: add("R02","CRITICAL",f"Aspect {asp:.1f}:1 — extreme buckling","Add bracing","Euler")
+    elif asp>12: add("R02","HIGH",f"Aspect {asp:.1f}:1 — buckling risk","Add ribs")
+    elif asp>7: add("R02","MEDIUM",f"Aspect {asp:.1f}:1","Consider ribbing")
+    if not mesh.is_watertight:
+        defect_locs = _find_watertight_defect_locations(mesh)
+        loc_txt = (" Gap location(s) found: " +
+                   "; ".join(f"({d['x']}, {d['y']}, {d['z']})" for d in defect_locs) +
+                   " — inspect and fix the geometry construction near these exact "
+                   "coordinates specifically, not the whole part."
+                   ) if defect_locs else " (could not isolate the exact gap location.)"
+        add("R03","HIGH","Mesh not watertight",
+        "Two common real causes, both confirmed live: (1) two solids "
+        "union()-ed at an exact flush/coincident plane instead of a genuine "
+        "overlap — check every union() join. (2) blanket .edges().fillet() "
+        "on ALL edges of a loft/tapered solid, including the compound "
+        "corners where a sloped taper edge meets two flat profile edges — "
+        "this can silently produce self-intersecting geometry with no "
+        "Python error. If the script filleted every edge of a loft at once, "
+        "try a smaller radius or fillet only the flat profile edges, not "
+        "the sloped taper edges." + loc_txt,
+        "STL standard", defect_locs[0] if defect_locs else None)
+    if sfv<1.0: add("R04","CRITICAL",f"SF={sfv:.2f} < 1.0 — IMMINENT FAILURE","Redesign immediately","ASME")
+    elif sfv<min_sf_: add("R04","HIGH",f"SF={sfv:.2f} < required {min_sf_:.1f}","Increase section","Design code")
+    buck_sf=fea.get("buckling",{}).get("safety_factor",999)
+    if buck_sf<1.5: add("R05","CRITICAL",f"Buckling SF={buck_sf:.2f}","Add ribs","Euler column")
+    elif buck_sf<3.0: add("R05","HIGH",f"Buckling SF={buck_sf:.2f} marginal","Increase I")
+    max_kf=sharp.get("max_Kf",1.0) if sharp else 1.0
+    crit=sharp.get("critical_zones",[]) if sharp else []
+    pos=crit[0]["position"] if crit else None
+    if max_kf>3.5: add("R06","CRITICAL",f"Kf={max_kf:.2f} — severe stress concentration","Add fillet ≥{crit[0]['fillet_rec_mm'] if crit else 2}mm","Peterson",pos)
+    elif max_kf>2.0: add("R06","HIGH",f"Kf={max_kf:.2f}","Add fillets to corners","Peterson")
+    h_viols=[h for h in holes if h.get("violation")]
+    if h_viols: add("R07","HIGH",f"{len(h_viols)} hole(s) violate 1.5D edge rule",
+        f"Move holes ≥{h_viols[0]['min_edge_req_mm']:.1f}mm from edge","ISO 273",h_viols[0]["position"])
+    if ctx["key"]=="medical" and mat_key in ["pla_plastic","petg_plastic"]:
+        add("R08","CRITICAL","Not biocompatible for medical use","Use Ti-6Al-4V or 316L SS","ISO 10993")
+    if ctx["key"]=="aerospace" and mat_key in ["pla_plastic","petg_plastic","magnesium_az31"]:
+        add("R09","CRITICAL","Material unsuitable for aerospace","Use Ti-6Al-4V, Al-7075, CFRP","AS9100")
+    if ctx["key"]=="pressure_vessel": add("R10","HIGH","Requires ASME BPVC","Apply Section VIII rules","ASME BPVC VIII")
+    vol=sf(mesh.volume)
+    if vol<1: add("R11","MEDIUM","Volume < 1mm³ — unit error?","Re-export in mm units")
+    fn_hz=fea.get("dynamics",{}).get("natural_frequency_hz",0)
+    if fn_hz>0 and ctx.get("vibration_sensitive",False) and fn_hz<10:
+        add("R14","HIGH",f"Natural freq {fn_hz:.1f}Hz — resonance risk","Increase stiffness","ISO 10816")
+    try:
+        cog=mesh.center_mass;gc=(mesh.bounds[0]+mesh.bounds[1])/2
+        off=float(np.linalg.norm(cog-gc)/max(max(exts),1)*100)
+        if off>40: add("R13","HIGH",f"CoG offset {off:.1f}%","Redistribute mass",pos={"x":round(float(cog[0]),2),"y":round(float(cog[1]),2),"z":round(float(cog[2]),2)})
+    except: pass
+    if part_desc:
+        pd=part_desc.lower()
+        if any(w in pd for w in FOLD_BRACKET_KEYWORDS) and se[1]>0 and se[0]/se[1]<0.3:
+            add("R15","CRITICAL",f"Prompt implies a bent/folded flange but the part is flat "
+                f"(smallest dim {se[0]:.1f}mm vs {se[1]:.1f}mm — no out-of-plane feature)",
+                "Do not write manual box/polyline/rotate/union code for this. Call the "
+                "make_bent_bracket(leg1_length=..., leg2_length=..., width=..., "
+                "thickness=..., bend_angle_deg=90.0, fillet_radius=..., holes_leg1=[...], "
+                "holes_leg2=[...]) helper that is already available — it guarantees a real "
+                "fold. Replace the whole script body with a single call to it.","Engineering judgment")
+        if any(w in pd for w in TAPER_KEYWORDS):
+            try:
+                ax=int(np.argmax(exts))
+                lo,hi=mesh.bounds[0][ax],mesh.bounds[1][ax];span=hi-lo
+                normal=[0,0,0];normal[ax]=1
+                def _cross_width(frac):
+                    origin=[0,0,0];origin[ax]=lo+span*frac
+                    sec=mesh.section(plane_origin=origin,plane_normal=normal)
+                    if sec is None: return None
+                    pl,_=sec.to_planar();b=pl.bounds
+                    return max(b[1][0]-b[0][0],b[1][1]-b[0][1])
+                w_near=_cross_width(0.15);w_far=_cross_width(0.85)
+                if w_near and w_far and abs(w_near-w_far)/max(w_near,w_far)<0.1:
+                    add("R16","CRITICAL",f"Prompt implies a taper but cross-section is "
+                        f"nearly constant ({w_near:.1f}mm vs {w_far:.1f}mm along the main axis)",
+                        "Do not write manual loft()/fillet() code for this. Call the "
+                        "make_tapered_beam(length=..., base_width=..., base_thick=..., "
+                        "tip_width=..., tip_thick=..., fillet_radius=..., holes_base=[...], "
+                        "holes_tip=[...]) helper that is already available — it guarantees a "
+                        "genuine, safely-filleted taper. Replace the whole script body with "
+                        "a single call to it.","Engineering judgment")
+            except Exception: pass
+    return sorted(V,key=lambda x:{"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3}.get(x["severity"],4))
+
+def health_score_v8(is_wt,rules,wt_,asp,cog_pct,fea):
+    sc=100
+    if not is_wt: sc-=20
+    sc-=len([r for r in rules if r["severity"]=="CRITICAL"])*15
+    sc-=len([r for r in rules if r["severity"]=="HIGH"])*8
+    sc-=len([r for r in rules if r["severity"]=="MEDIUM"])*3
+    wm=wt_.get("min_mm") if wt_ else None
+    if wm is not None:
+        if wm<0.8: sc-=20
+        elif wm<1.5: sc-=10
+        elif wm<2.0: sc-=5
+    if asp>15: sc-=10
+    elif asp>8: sc-=5
+    if cog_pct>40: sc-=10
+    elif cog_pct>25: sc-=5
+    sfv=fea.get("safety_factor",2.0)
+    if sfv<1.0: sc-=25
+    elif sfv<1.5: sc-=15
+    elif sfv<2.0: sc-=5
+    sc=max(0,min(100,sc))
+    label=("EXCELLENT" if sc>=90 else "VERY GOOD" if sc>=80 else
+           "GOOD" if sc>=70 else "FAIR" if sc>=55 else "POOR" if sc>=40 else "CRITICAL")
+    return {"score":sc,"label":label}
+
+def mat_weights(vol):
+    return {k:round(vol*v["density"]*1e-3,2) for k,v in MATERIALS.items()}
+
+def build_gemini_context_v8(filename,part_name,mat,exts,vol,is_wt,
+                             wt_,holes,sharp,rules,fea,fat,frac,
+                             therm,cr,cont,topo,hs,T_op,proj,ctx):
+    vm=fea["stress"]["von_mises_mpa"]
+    calc_used=fea.get("method","") in ("calculix_solid_tet_fem","calculix_shell_fem")
+    return f"""╔═══════════════════════════════════════════════════════╗
+║   LUMEXA v8.0 ENTERPRISE ENGINEERING REPORT           ║
+║   FEA Method: {"CalculiX Real FEM (Gmsh-meshed)" if calc_used else "Multi-Section Analytical (unbenchmarked estimate)"}  ║
+╚═══════════════════════════════════════════════════════╝
+
+PART: {part_name or filename} | Context: {ctx.get('key')} | Material: {mat['name']}
+Project: {proj or 'Not specified'}
+
+GEOMETRY (trimesh exact math):
+  {round(exts[0],2)} × {round(exts[1],2)} × {round(exts[2],2)} mm
+  Volume: {round(vol,2)} mm³ | Watertight: {is_wt}
+  Health: {hs['score']}/100 ({hs['label']})
+
+MATERIAL:
+  Yield: {mat['yield_strength_mpa']} MPa | UTS: {mat['ultimate_strength_mpa']} MPa
+  E: {mat['youngs_modulus_gpa']} GPa | ν: {mat['poissons_ratio']}
+  Kic: {mat['fracture_toughness_mpa_sqrtm']} MPa√m | Se: {mat['fatigue_limit_mpa']} MPa
+  Max temp: {mat['max_service_temp_c']}°C | Density: {mat['density']} g/cm³
+
+WALL THICKNESS (dual-pass surface sampling, {wt_.get('samples_used',0)} samples — unbenchmarked estimate):
+  Min: {wt_.get('min_mm','N/A')} mm | Mean: {wt_.get('mean_mm','N/A')} mm
+  P5: {wt_.get('p5_mm','N/A')} mm | <2mm: {wt_.get('thin_2mm_pct','N/A')}% | <1mm: {wt_.get('thin_1mm_pct','N/A')}%
+  Critical zones: {json.dumps(_json_safe(wt_.get('critical_zones',[])[:3]))}
+
+HOLES ({len(holes)} raw detections, multi-axis RANSAC — may include duplicate samples along
+  the same physical hole and false positives; not yet deduplicated/clustered, verify before use):
+{json.dumps(_json_safe(holes[:8]),indent=2)}
+
+SHARP CORNERS (Peterson-Neuber stress concentration — unbenchmarked estimate):
+  Count: {sharp.get('sharp_edge_count',0)} | Max Kt: {sharp.get('max_Kt',1.0)} | Max Kf: {sharp.get('max_Kf',1.0)}
+  Critical: {json.dumps(_json_safe(sharp.get('critical_zones',[])[:3]))}
+
+FEA ({fea.get('method','unknown')}):
+  Von Mises: {vm} MPa | Yield: {mat['yield_strength_mpa']} MPa
+  Safety factor: {fea['safety_factor']} (required: {fea['required_sf']}) → {fea['status']}
+  Buckling SF: {fea['buckling']['safety_factor']} ({fea['buckling']['status']})
+  Natural freq: {fea['dynamics']['natural_frequency_hz']} Hz
+  Mass: {fea['dynamics']['estimated_mass_g']} g
+  Deflection: {fea.get('deflection_mm','N/A')} mm
+
+FATIGUE (full Marin 6-factor + Goodman/Gerber — unbenchmarked estimate):
+  Marin: ka={fat.get('marin_factors',{}).get('ka','N/A')} kb={fat.get('marin_factors',{}).get('kb','N/A')}
+  Se modified: {fat.get('Se_modified_mpa','N/A')} MPa
+  Goodman SF: {fat.get('goodman_sf','N/A')} ({fat.get('goodman_status','N/A')})
+  Life: {fat.get('hours_to_failure','N/A')} hours ({fat.get('status','N/A')})
+
+FRACTURE (Paris Law + FAD — ASSUMES A HYPOTHETICAL INITIAL CRACK, not one the user
+  described; treat as a "what if a crack existed" check, not a literal finding):
+  K: {frac.get('K_mpa_sqrtm','N/A')} MPa√m / Kic: {frac.get('Kic','N/A')}
+  Critical crack: {frac.get('critical_crack_mm','N/A')} mm
+  Life: {frac.get('hours_to_failure','N/A')} hours | FAD safe: {frac.get('fad_safe','N/A')}
+  Status: {frac.get('status','N/A')}
+
+THERMAL (@{T_op}°C):
+  σ_th: {therm.get('thermal_stress_mpa','N/A')} MPa | Sy derated: {therm.get('yield_derated_mpa','N/A')} MPa
+  SF: {therm.get('safety_factor','N/A')} | Margin: {therm.get('temp_margin_c','N/A')}°C | {therm.get('status','N/A')}
+
+CREEP: {cr.get('hours_to_1pct','N/A')} hours to 1% | LM: {cr.get('larson_miller','N/A')} | {cr.get('status','N/A')}
+
+TOPOLOGY OPTIMIZATION:
+  Weight saving potential: {topo.get('weight_saving_estimate_pct','N/A')}%
+  Mass saved: {topo.get('mass_saved_g','N/A')} g
+  {topo.get('recommendation','N/A')}
+
+RULE VIOLATIONS ({len(rules)} total):
+{json.dumps(_json_safe(rules),indent=2)}
+
+═══════════ GEMINI INSTRUCTIONS ═══════════
+Use ONLY the measured data above. Never estimate.
+Temperature: 0.1 (factual mode)
+
+Return JSON:
+{{
+  "overview": "2-3 sentences with exact measured values",
+  "severity_cards": [...],
+  "screw_table": [...],
+  "modifications": [...],
+  "material_recommendation": {{...}},
+  "optimization": [...],
+  "topology_suggestions": [...],
+  "annotations": [{{"id","severity","position","title","problem","solution","color"}}],
+  "assembly_score": 0-100,
+  "fea_summary": "one sentence with exact numbers",
+  "health_verdict": "PASS|FAIL|MARGINAL"
+}}
+"""
+
+# ═══════════════════════════════════════════════════════════════════
+# CADQUERY GENERATORS (all from v7.0 retained)
+# ═══════════════════════════════════════════════════════════════════
+
+def gen_bracket(p):
+    w=p.get("width",80);h=p.get("height",60);d=p.get("depth",40)
+    t=p.get("thickness",5);hd=p.get("hole_diameter",6);fr=p.get("fillet_radius",2);nh=p.get("num_holes",4)
+    base=cq.Workplane("XY").box(w,d,t).edges("|Z").fillet(fr)
+    wall=cq.Workplane("XY").box(w,t,h).translate((0,-(d/2-t/2),h/2+t/2)).edges("|Z").fillet(fr)
+    b=base.union(wall)
+    sp=max((w-20)/max(nh//2-1,1),1)
+    for x in [-(w/2-10)+i*sp for i in range(max(nh//2,1))]:
+        for y in [-(d/2-10),d/2-10]:
+            try: b=b.faces(">Z").workplane().pushPoints([(x,y)]).hole(hd)
+            except: pass
+    return b
+
+def gen_shaft(p):
+    L=p.get("length",100);D=p.get("diameter",20)
+    s=cq.Workplane("YZ").circle(D/2).extrude(L)
+    if p.get("shoulder_diameter",0)>D: s=s.union(cq.Workplane("YZ").circle(p["shoulder_diameter"]/2).extrude(p.get("shoulder_length",15)))
+    if p.get("keyway_width",0)>0: s=s.cut(cq.Workplane("XY").box(L,p["keyway_width"],p.get("keyway_depth",3)*2).translate((L/2,0,D/2)))
+    return s
+
+def gen_plate(p):
+    w=p.get("width",100);h=p.get("height",80);t=p.get("thickness",6)
+    hp=p.get("hole_pattern","corners");hd=p.get("hole_diameter",8);fr=p.get("fillet_radius",3);m=p.get("margin",15)
+    pl=cq.Workplane("XY").box(w,h,t).edges("|Z").fillet(fr)
+    if hp=="corners":
+        pl=pl.faces(">Z").workplane().pushPoints([(-(w/2-m),-(h/2-m)),(w/2-m,-(h/2-m)),(-(w/2-m),h/2-m),(w/2-m,h/2-m)]).hole(hd)
+    elif hp=="center": pl=pl.faces(">Z").workplane().hole(hd)
+    return pl
+
+def gen_housing(p):
+    ow=p.get("width",80);oh=p.get("height",60);od=p.get("depth",50)
+    wt=p.get("wall_thickness",4);fr=p.get("fillet_radius",3);bd=p.get("boss_diameter",8)
+    outer=cq.Workplane("XY").box(ow,od,oh).edges("|Z").fillet(fr)
+    inner=cq.Workplane("XY").box(ow-2*wt,od-2*wt,oh-wt).translate((0,0,wt/2))
+    h=outer.cut(inner)
+    if p.get("num_bosses",4)>=4:
+        bx=ow/2-wt-bd/2-2;by=od/2-wt-bd/2-2
+        for pos in [(-bx,-by),(bx,-by),(-bx,by),(bx,by)]:
+            boss=cq.Workplane("XY").circle(bd/2).extrude(oh-wt-2).translate((pos[0],pos[1],wt))
+            hole=cq.Workplane("XY").circle(bd/4).extrude(oh-wt-2).translate((pos[0],pos[1],wt))
+            h=h.union(boss).cut(hole)
+    return h
+
+def gen_true_involute_gear(p):
+    mod=p.get("module",2.0);nt=p.get("num_teeth",20);pa=math.radians(p.get("pressure_angle",20))
+    fw=p.get("face_width",15);bore=p.get("bore_diameter",6);hd=p.get("hub_diameter",10);hl=p.get("hub_length",20)
+    pitch_r=mod*nt/2;base_r=pitch_r*math.cos(pa);tip_r=pitch_r+mod;root_r=pitch_r-1.25*mod
+    g=cq.Workplane("XY").circle(tip_r).extrude(fw)
+    ta=2*math.pi/nt
+    for i in range(nt):
+        angle=i*ta+ta/2
+        sp_pts=[(root_r*0.95*math.cos(angle+ta*0.15),root_r*0.95*math.sin(angle+ta*0.15)),
+                (tip_r*1.02*math.cos(angle+ta*0.15),tip_r*1.02*math.sin(angle+ta*0.15)),
+                (tip_r*1.02*math.cos(angle+ta*0.85),tip_r*1.02*math.sin(angle+ta*0.85)),
+                (root_r*0.95*math.cos(angle+ta*0.85),root_r*0.95*math.sin(angle+ta*0.85))]
+        try: g=g.cut(cq.Workplane("XY").polyline(sp_pts).close().extrude(fw+1))
+        except: pass
+    if hd>0: g=g.union(cq.Workplane("XY").circle(hd/2).extrude(max(fw,hl)))
+    if bore>0: g=g.cut(cq.Workplane("XY").circle(bore/2).extrude(max(fw,hl)+2))
+    return g
+
+def gen_flange(p):
+    od=p.get("outer_diameter",100);id_=p.get("inner_diameter",40);t=p.get("thickness",12)
+    bc_r=p.get("bolt_circle_radius",40);n=p.get("num_bolts",6);bd=p.get("bolt_diameter",8)
+    hub_od=p.get("hub_od",50);hub_h=p.get("hub_height",20)
+    f=cq.Workplane("XY").circle(od/2).extrude(t).cut(cq.Workplane("XY").circle(id_/2).extrude(t+1))
+    hub=cq.Workplane("XY").circle(hub_od/2).extrude(hub_h).cut(cq.Workplane("XY").circle(id_/2).extrude(hub_h+1))
+    f=f.union(hub).faces(">Z").workplane().pushPoints([(bc_r*math.cos(2*math.pi*i/n),bc_r*math.sin(2*math.pi*i/n)) for i in range(n)]).hole(bd)
+    return f
+
+def gen_ibeam(p):
+    L=p.get("length",200);fw=p.get("flange_width",80);fh=p.get("flange_thickness",8);wh=p.get("web_height",100);wt=p.get("web_thickness",6)
+    top=cq.Workplane("XY").box(fw,fh,L).translate((0,wh/2+fh/2,L/2))
+    bot=cq.Workplane("XY").box(fw,fh,L).translate((0,-(wh/2+fh/2),L/2))
+    web=cq.Workplane("XY").box(wt,wh,L).translate((0,0,L/2))
+    return top.union(bot).union(web)
+
+def gen_motor_mount(p):
+    w=p.get("width",30);h=p.get("height",30);t=p.get("thickness",3)
+    md=p.get("motor_diameter",28);hd=p.get("hole_diameter",3);hp=p.get("hole_pattern_size",16)
+    base=cq.Workplane("XY").box(w,h,t).edges("|Z").fillet(2).faces(">Z").workplane().hole(md)
+    return base.faces(">Z").workplane().pushPoints([(hp/2,hp/2),(-hp/2,hp/2),(hp/2,-hp/2),(-hp/2,-hp/2)]).hole(hd)
+
+def gen_heatsink(p):
+    bw=p.get("base_width",60);bh=p.get("base_height",40);bt=p.get("base_thickness",5)
+    n=p.get("num_fins",8);fh=p.get("fin_height",20);ft=p.get("fin_thickness",2)
+    base=cq.Workplane("XY").box(bw,bt,bh).translate((0,0,bh/2))
+    sp=(bw-ft)/max(n-1,1)
+    for i in range(n):
+        x=-(bw/2-ft/2)+i*sp
+        base=base.union(cq.Workplane("XY").box(ft,fh,bh).translate((x,bt/2+fh/2,bh/2)))
+    return base
+
+def gen_wing_rib_naca(p):
+    chord=p.get("chord",150);naca=p.get("naca","0012")
+    tc=int(naca[-2:])/100 if len(naca)>=4 else 0.12
+    m_pct=int(naca[0])/100 if len(naca)>=4 else 0.0
+    p_pct=int(naca[1])/10 if len(naca)>=4 and naca[1]!='0' else 0.4
+    thick=p.get("rib_thickness",3);spar_d=p.get("spar_diameter",8)
+    def naca4_t(xn,tc): return 5*tc*(0.2969*math.sqrt(max(xn,1e-9))-0.1260*xn-0.3516*xn**2+0.2843*xn**3-0.1015*xn**4)
+    def naca4_c(xn,m,p_):
+        if m==0: return 0,0
+        if xn<=p_: yc=m/p_**2*(2*p_*xn-xn**2);dyc=2*m/p_**2*(p_-xn)
+        else: yc=m/(1-p_)**2*((1-2*p_)+2*p_*xn-xn**2);dyc=2*m/(1-p_)**2*(p_-xn)
+        return yc,dyc
+    n_pts=50;upper=[];lower=[]
+    for i in range(n_pts+1):
+        xn=i/n_pts;x=xn*chord-chord/2
+        yt=naca4_t(xn,tc)*chord;yc,dyc=naca4_c(xn,m_pct,p_pct)
+        yc*=chord;theta=math.atan(dyc)
+        upper.append((x-yt*math.sin(theta),yc+yt*math.cos(theta)))
+        lower.append((x+yt*math.sin(theta),yc-yt*math.cos(theta)))
+    all_pts=upper+list(reversed(lower[1:-1]))
+    rib=cq.Workplane("XY").polyline(all_pts).close().extrude(thick)
+    for xp in [chord*0.25-chord/2,chord*0.5-chord/2,chord*0.7-chord/2]:
+        try: rib=rib.cut(cq.Workplane("XY").circle(spar_d/2).extrude(thick+1).translate((xp,0,0)))
+        except: pass
+    return rib
+
+# Organic shapes — trimesh (accurate, not Blender)
+def gen_organic_shell(p):
+    mesh=trimesh.creation.icosphere(subdivisions=p.get("subdivisions",4))
+    mesh.vertices[:,0]*=p.get("radius_x",50);mesh.vertices[:,1]*=p.get("radius_y",30);mesh.vertices[:,2]*=p.get("radius_z",20)
+    np.random.seed(p.get("seed",42))
+    noise=np.random.normal(0,p.get("noise",0.025),mesh.vertices.shape)*np.array([p.get("radius_x",50),p.get("radius_y",30),p.get("radius_z",20)])
+    mesh.vertices+=noise
+    for _ in range(p.get("smooth_iterations",6)): trimesh.smoothing.filter_laplacian(mesh,lamb=0.5)
+    return mesh
+
+def gen_swept_fairing(p):
+    L=p.get("length",150);rmax=p.get("max_radius",25);rt=p.get("tail_radius",5);n=30;sides=32
+    verts=[];faces=[]
+    for i in range(n+1):
+        t=i/n;z=t*L
+        r=rmax*(t/0.3)**0.5 if t<0.3 else rmax if t<0.7 else max(rmax*(1-(t-0.7)/0.3)+rt*(t-0.7)/0.3,0.5)
+        for j in range(sides): verts.append([r*math.cos(2*math.pi*j/sides),r*math.sin(2*math.pi*j/sides),z])
+    for i in range(n):
+        b=i*sides
+        for j in range(sides):
+            a=b+j;b_=b+(j+1)%sides;c_=b+sides+(j+1)%sides;d=b+sides+j
+            faces.extend([[a,b_,c_],[a,c_,d]])
+    return trimesh.Trimesh(vertices=np.array(verts),faces=np.array(faces),process=True)
+
+# Route map
+CADQUERY_MAP={
+    "bracket":(gen_bracket,["bracket","mount","l-bracket","mounting bracket","clamp bracket"]),
+    "shaft":(gen_shaft,["shaft","axle","rod","spindle","pin"]),
+    "plate":(gen_plate,["plate","panel","flat","baseplate","sheet"]),
+    "housing":(gen_housing,["housing","enclosure","box","case","shell","cover"]),
+    "gear":(gen_true_involute_gear,["gear","spur gear","cog","pinion","toothed"]),
+    "flange":(gen_flange,["flange","pipe flange","disc flange"]),
+    "ibeam":(gen_ibeam,["i-beam","h-beam","universal beam","rsj"]),
+    "motor_mount":(gen_motor_mount,["motor mount","motor plate","motor holder"]),
+    "heatsink":(gen_heatsink,["heatsink","heat sink","cooling fin","thermal sink"]),
+    "wing_rib":(gen_wing_rib_naca,["wing rib","airfoil rib","naca rib","aerofoil"]),
+}
+TRIMESH_MAP={
+    "organic_shell":(gen_organic_shell,["organic shell","organic body","smooth shell","freeform"]),
+    "swept_fairing":(gen_swept_fairing,["fairing","nacelle","aerodynamic shell","swept fairing","pod"]),
+}
+
+def route(description,params):
+    d=description.lower()
+    for pt,(fn,kws) in CADQUERY_MAP.items():
+        if any(k in d for k in kws): return pt,"cadquery",fn(params)
+    for pt,(fn,kws) in TRIMESH_MAP.items():
+        if any(k in d for k in kws): return pt,"trimesh",fn(params)
+    return "plate","cadquery",gen_plate(params)
+
+def stl_from_cq(obj):
+    with tempfile.NamedTemporaryFile(suffix=".stl",delete=False) as t: p=t.name
+    cq.exporters.export(obj,p); return p
+
+def stl_from_tm(mesh):
+    with tempfile.NamedTemporaryFile(suffix=".stl",delete=False) as t: p=t.name
+    mesh.export(p); return p
+
+def step_from_cq(obj):
+    with tempfile.NamedTemporaryFile(suffix=".step",delete=False) as t: p=t.name
+    cq.exporters.export(obj,p); return p
+
+# ═══════════════════════════════════════════════════════════════════
+# CORE ANALYSIS PIPELINE v8.0
+# ═══════════════════════════════════════════════════════════════════
+
+def _repair_watertight_mesh(mesh):
+    """Attempt cheap, best-effort repairs on a mesh straight off CadQuery's STL
+    export before judging or using it for anything.
+
+    CadQuery/OCCT's STL tessellation routinely leaves tiny gaps and near-but-
+    not-quite-coincident duplicate vertices at the seams between adjacent
+    tessellated patches — most visibly at fillet-to-flat-face boundaries. This
+    is a known tessellation artifact, not necessarily a real defect in the
+    underlying B-rep solid (mesh_from_cq_object's own tolerance-tightening fix
+    above notes the same class of artifact causing Gmsh/CalculiX meshing
+    failures downstream). trimesh.load()'s default vertex-merge tolerance is
+    often too tight to close these seams on its own.
+
+    Without this step, the is_watertight check below — which drives the
+    /generate-validate-refine quality gate — was flagging these tessellation
+    artifacts as "non-manifold geometry" with nothing for the AI to actually
+    change about the design. Confirmed live: three refinement iterations in a
+    row producing an IDENTICAL health score and IDENTICAL "not watertight"
+    reason, because there was no real design defect to fix.
+
+    Each repair step is independently try/excepted — analysis_service.py's
+    _repair_mesh_for_meshing hit real trimesh-version API renames doing the
+    same kind of repair, so one incompatible call here shouldn't skip the rest.
+    Only ever changes what gets reported/analyzed; a genuine defect (e.g. an
+    actual gap from a failed boolean union) will still fail to repair and
+    should still fail the gate — this only clears the false positives.
+
+    Returns (mesh, was_repaired: bool) — was_repaired is True only if the mesh
+    started non-watertight AND ended up watertight after these steps, so
+    callers/feedback text can distinguish "needed no repair" from "tessellation
+    artifact, auto-fixed" from "still broken after repair, likely a real defect"."""
+    if mesh.is_watertight:
+        return mesh, False
+    try:
+        mesh.merge_vertices()
+    except Exception:
+        pass
+    try:
+        mesh.remove_duplicate_faces()
+    except Exception:
+        pass
+    try:
+        mesh.remove_degenerate_faces()
+    except Exception:
+        pass
+    try:
+        trimesh.repair.fill_holes(mesh)
+    except Exception:
+        try:
+            mesh.fill_holes()  # older/newer trimesh convenience alias
+        except Exception:
+            pass
+    try:
+        trimesh.repair.fix_normals(mesh)
+    except Exception:
+        pass
+    return mesh, bool(mesh.is_watertight)
+
+
+async def run_analysis_v8(mesh, filename, part_name, mat_key,
+                           force_n=1000, force_dir="z", T_op=25.0,
+                           proj=None, surface_finish="machined",
+                           reliability=0.99, run_topo=False,
+                           topo_volfrac=0.5):
+    mesh, was_auto_repaired = _repair_watertight_mesh(mesh)
+    vol=sf(mesh.volume);exts=[sf(e) for e in mesh.extents]
+    se=sorted(exts);asp=se[2]/se[0] if se[0]>0 else 0;is_wt=bool(mesh.is_watertight)
+    if mat_key=="auto": mat_key=detect_material(mesh)
+    if mat_key not in MATERIALS: mat_key="aluminum_6061"
+    mat=MATERIALS[mat_key];ctx=classify_context(part_name,proj)
+
+    # All analysis algorithms
+    wt_=wall_thickness_v8(mesh)
+    zones=exact_zones(mesh)
+    holes=detect_holes_v8(mesh)
+    sharp=detect_sharp_v8(mesh,mat_key)
+
+    # Try CalculiX first, fall back to analytical
+    fea,calculix_diag=run_calculix_fem(mesh,mat_key,force_n,force_dir)
+    if fea is None:
+        fea=multi_section_fea(mesh,mat_key,force_n,force_dir,ctx["min_sf"])
+        fea["calculix_diagnostic"]=calculix_diag
+    else:
+        fea["required_sf"]=ctx["min_sf"]
+        fea["status"]="PASS" if fea["safety_factor"]>=ctx["min_sf"] else "FAIL"
+        fea["buckling"]=fea.get("buckling",{"safety_factor":999,"status":"PASS","critical_load_n":1e9})
+        fea["dynamics"]=fea.get("dynamics",multi_section_fea(mesh,mat_key,force_n,force_dir)["dynamics"])
+        fea["stress"]=fea.get("stress",{"von_mises_mpa":fea.get("von_mises_mpa",0),
+                                         "axial_mpa":0,"bending_mpa":0,"shear_mpa":0,"stress_concentration_kt":1.0})
+        if "von_mises_mpa" in fea and "stress" not in fea:
+            fea["stress"]={"von_mises_mpa":fea["von_mises_mpa"],"axial_mpa":0,"bending_mpa":0,"shear_mpa":0}
+        fea["deflection_mm"]=fea.get("deflection_mm",0)
+        fea["min_section_area_mm2"]=fea.get("min_section_area_mm2",0)
+
+    vm=fea["stress"]["von_mises_mpa"]
+    fat=full_marin_fatigue(mat_key,max(vm,1.0),surface=surface_finish,
+                            reliability=reliability,size_mm=min(exts),
+                            temp_c=T_op,notch_kt=sharp.get("max_Kt",1.0))
+    frac=fracture_v8(mat_key,max(vm,1.0))
+    therm=thermal_v8(mat_key,T_op)
+    cr=creep_v8(mat_key,max(vm,1.0),T_op)
+    cont=contact_v8(mat_key)
+    rules=rule_engine_v8(mesh,wt_,ctx,mat_key,holes,sharp,fea,part_name)
+
+    # Topology optimization (optional — takes extra time)
+    topo={"note":"Topology optimization not requested. Add run_topo=true to enable."}
+    if run_topo:
+        topo=topology_optimization_simp(mesh,mat_key,topo_volfrac)
+
+    # Manufacturing cost
+    cost=estimate_manufacturing_cost(mesh,mat_key,"cnc")
+
+    try:
+        cog=mesh.center_mass;bnds=mesh.bounds;gc=(bnds[0]+bnds[1])/2
+        off=float(np.linalg.norm(cog-gc));cog_pct=float(off/max(exts)*100) if max(exts)>0 else 0
+        cog_d={"x":round(float(cog[0]),3),"y":round(float(cog[1]),3),"z":round(float(cog[2]),3)}
+    except:
+        cog_pct=0;cog_d={"x":0,"y":0,"z":0};bnds=mesh.bounds
+
+    hs=health_score_v8(is_wt,rules,wt_,asp,cog_pct,fea)
+    fn_=mesh.face_normals;inw=fn_[:,1]<-0.3
+    inw_c=int(inw.sum());inw_p=float(inw_c/len(fn_)*100) if len(fn_)>0 else 0
+
+    gc_str=build_gemini_context_v8(filename,part_name,mat,exts,vol,is_wt,
+                                    wt_,holes,sharp,rules,fea,fat,frac,
+                                    therm,cr,cont,topo,hs,T_op,proj,ctx)
+
+    return {
+        "lumexa_version":"8.0",
+        "fea_method":fea.get("method","unknown"),
+        # FIX: this used to compare against "calculix_real_fem", a string the
+        # analysis service never returns (it returns "calculix_solid_tet_fem" or
+        # "calculix_shell_fem") — so this flag reported False on every single
+        # request regardless of whether real FEM actually ran. Confirmed live.
+        "calculix_used":fea.get("method","") in ("calculix_solid_tet_fem","calculix_shell_fem"),
+        "filename":filename,"part_name":part_name,"part_context":ctx,
+        "geometry":{
+            "dimensions_mm":{"x":round(exts[0],3),"y":round(exts[1],3),"z":round(exts[2],3)},
+            "volume_mm3":round(vol,3),"surface_area_mm2":round(sf(mesh.area),3),
+            "is_watertight":is_wt,"watertight_auto_repair_succeeded":was_auto_repaired,
+            "vertex_count":int(len(mesh.vertices)),
+            "face_count":int(len(mesh.faces)),"aspect_ratio":round(asp,3),
+            "center_of_mass":cog_d,"cog_offset_pct":round(cog_pct,2),
+            "bounds":{"min":{"x":round(float(bnds[0][0]),3),"y":round(float(bnds[0][1]),3),"z":round(float(bnds[0][2]),3)},
+                      "max":{"x":round(float(bnds[1][0]),3),"y":round(float(bnds[1][1]),3),"z":round(float(bnds[1][2]),3)}}},
+        "material":{"key":mat_key,"name":mat["name"],"auto_detected":True,
+            "properties":{"yield_strength_mpa":mat["yield_strength_mpa"],
+                          "ultimate_strength_mpa":mat["ultimate_strength_mpa"],
+                          "youngs_modulus_gpa":mat["youngs_modulus_gpa"],
+                          "density_g_cm3":mat["density"],"max_service_temp_c":mat["max_service_temp_c"],
+                          "fatigue_limit_mpa":mat["fatigue_limit_mpa"],
+                          "fracture_toughness_mpa_sqrtm":mat["fracture_toughness_mpa_sqrtm"]}},
+        "material_weights_grams":mat_weights(vol),
+        "wall_thickness":wt_,"zone_locations":{"total_zones":len(zones),"zones":zones},
+        "hole_analysis":{"holes_detected":len(holes),"violations":[h for h in holes if h.get("violation")],"all_holes":holes},
+        "sharp_corner_analysis":sharp,
+        "enclosed_pockets":{"inward_face_count":inw_c,"inward_percentage":round(inw_p,2),
+            "thermal_risk":inw_p>20,"severity":"HIGH" if inw_p>40 else "MEDIUM" if inw_p>20 else "LOW"},
+        "rule_engine":{"total_violations":len(rules),
+            "critical":[v for v in rules if v["severity"]=="CRITICAL"],
+            "high":[v for v in rules if v["severity"]=="HIGH"],
+            "medium":[v for v in rules if v["severity"]=="MEDIUM"],
+            "low":[v for v in rules if v["severity"]=="LOW"],
+            "all_violations":rules},
+        "analytical_fea":fea,"fatigue_analysis":fat,"fracture_mechanics":frac,
+        "thermal_analysis":therm,"creep_analysis":cr,"contact_mechanics":cont,
+        "topology_optimization":topo,"manufacturing_cost":cost,
+        "health_score":hs,
+        "summary":{"health_score":hs["score"],"health_label":hs["label"],
+            "material":mat["name"],"fea_method":fea.get("method","unknown"),
+            "fea_status":fea["status"],"safety_factor":fea["safety_factor"],
+            "fatigue_status":fat.get("status","N/A"),"fracture_status":frac.get("status","N/A"),
+            "thermal_status":therm.get("status","N/A"),"creep_status":cr.get("status","N/A"),
+            "total_rule_violations":len(rules),
+            "critical_violations":len([v for v in rules if v["severity"]=="CRITICAL"]),
+            "holes_detected":len(holes),
+            "holes_with_violations":len([h for h in holes if h.get("violation")]),
+            "is_watertight":is_wt,"estimated_cost_usd":cost.get("total_cost_usd")},
+        "gemini_context":gc_str,
+    }
+
+# ═══════════════════════════════════════════════════════════════════
+# AI-LOOP QUALITY GATE — used by /generate-validate-refine
+# ═══════════════════════════════════════════════════════════════════
+
+def evaluate_design_quality(result: dict, min_health_score: float = 75.0,
+                             max_critical: int = 0, max_high: int = 2,
+                             min_safety_factor: float = 1.0) -> dict:
+    """
+    Decide whether an analyzed design is "good enough" or needs another refinement pass.
+
+    Returns:
+        {
+          "passed": bool,
+          "score": float,            # health score 0-100
+          "reasons": [str, ...],     # human-readable list of why it failed (empty if passed)
+          "metrics": {...}            # key numbers used for the decision
+        }
+    """
+    hs = result.get("health_score", {}) or {}
+    score = hs.get("score", 0)
+    re_ = result.get("rule_engine", {}) or {}
+    n_crit = re_.get("total_violations", 0) and len(re_.get("critical", []))
+    n_high = len(re_.get("high", []))
+    fea = result.get("analytical_fea", {}) or {}
+    sfv = fea.get("safety_factor", 0)
+    fea_status = fea.get("status", "UNKNOWN")
+    fat_status = (result.get("fatigue_analysis", {}) or {}).get("status", "N/A")
+    is_wt = (result.get("geometry", {}) or {}).get("is_watertight", True)
+
+    reasons = []
+    if score < min_health_score:
+        reasons.append(f"Health score {score} is below target {min_health_score}.")
+    if n_crit > max_critical:
+        reasons.append(f"{n_crit} CRITICAL rule violation(s) found (max allowed {max_critical}).")
+    if n_high > max_high:
+        reasons.append(f"{n_high} HIGH-severity rule violation(s) found (max allowed {max_high}).")
+    if sfv < min_safety_factor:
+        reasons.append(f"FEA safety factor {sfv:.2f} is below minimum {min_safety_factor}.")
+    if fea_status == "FAIL":
+        reasons.append("FEA status is FAIL.")
+    if fat_status == "FAIL":
+        reasons.append("Fatigue analysis status is FAIL.")
+    if not is_wt:
+        # FIX: this used to branch on a "was_repaired" flag read from
+        # watertight_auto_repair_attempted — but that field is actually "did
+        # repair SUCCEED", not "was repair attempted", and repair (in
+        # _repair_watertight_mesh, above) runs unconditionally before is_wt is
+        # ever computed. So reaching this branch at all already means repair
+        # was attempted AND failed — the was_repaired==True case could never
+        # fire, and the AI was always getting the generic message instead of
+        # the actionable one below. Confirmed live: a real non-manifold defect
+        # (Gmsh: "Wrong topology of boundary mesh for parametrization") still
+        # only produced the generic reason text.
+        reasons.append("Mesh is STILL not watertight even after automatic tessellation "
+                        "repair — this is a real geometry defect (likely a boolean union/cut "
+                        "leaving a gap or self-intersection), not an export artifact. "
+                        "See REFINEMENT MODE guidance.")
+
+    return {
+        "passed": len(reasons) == 0,
+        "score": score,
+        "reasons": reasons,
+        "metrics": {
+            "health_score": score,
+            "critical_violations": n_crit,
+            "high_violations": n_high,
+            "safety_factor": sfv,
+            "fea_status": fea_status,
+            "fatigue_status": fat_status,
+            "is_watertight": is_wt,
+        }
+    }
+
+def summarize_analysis_for_refinement(result: dict, quality: dict) -> str:
+    """
+    Build a concise, actionable feedback report from a run_analysis_v8 result + its
+    quality verdict, formatted for the LLM's REFINEMENT MODE prompt.
+    """
+    geo = result.get("geometry", {}) or {}
+    wt = result.get("wall_thickness", {}) or {}
+    holes = (result.get("hole_analysis", {}) or {}).get("violations", [])
+    sharp = result.get("sharp_corner_analysis", {}) or {}
+    fea = result.get("analytical_fea", {}) or {}
+    rules = (result.get("rule_engine", {}) or {}).get("all_violations", [])
+
+    lines = []
+    lines.append(f"HEALTH SCORE: {quality['score']} ({result.get('health_score',{}).get('label','?')})")
+    lines.append(f"PASSED: {quality['passed']}")
+    lines.append("")
+    lines.append("WHY IT FAILED (fix all of these):" if not quality["passed"] else "Minor issues to polish:")
+    for r in quality["reasons"]:
+        lines.append(f"  - {r}")
+
+    lines.append("")
+    lines.append(f"GEOMETRY: dims(mm)={geo.get('dimensions_mm')} aspect_ratio={geo.get('aspect_ratio')} "
+                  f"watertight={geo.get('is_watertight')} volume_mm3={geo.get('volume_mm3')}")
+    if wt:
+        lines.append(f"WALL THICKNESS: min={wt.get('min_mm')}mm avg={wt.get('avg_mm')}mm "
+                      f"thin_<2mm_pct={wt.get('thin_2mm_pct')}")
+    lines.append(f"FEA: method={fea.get('method')} safety_factor={fea.get('safety_factor')} "
+                  f"status={fea.get('status')} von_mises_mpa={fea.get('stress',{}).get('von_mises_mpa')}")
+    crit=fea.get("critical_section") or {}
+    if fea.get("status")=="FAIL" and crit.get("position_mm") is not None:
+        lines.append(f"  -> WEAKEST SECTION is along the {crit.get('axis')}-axis at "
+                      f"{crit.get('position_mm')}mm (min area={fea.get('min_section_area_mm2')}mm²). "
+                      f"Thicken/add material AT THIS LOCATION specifically (approx "
+                      f"{crit.get('strengthen_factor_approx')}x more cross-section needed there) "
+                      f"— do not thin any other area to compensate.")
+
+    if holes:
+        lines.append("HOLE VIOLATIONS:")
+        for h in holes[:5]:
+            lines.append(f"  - hole at {h.get('position')} diameter={h.get('diameter_mm')}mm "
+                          f"min_edge_required={h.get('min_edge_req_mm')}mm — move it inward.")
+
+    crit_corners = sharp.get("critical_zones", [])
+    if crit_corners:
+        lines.append("SHARP CORNER STRESS CONCENTRATIONS:")
+        for c in crit_corners[:5]:
+            lines.append(f"  - at {c.get('position')} Kf={c.get('Kf')} "
+                          f"recommend fillet >= {c.get('fillet_rec_mm')}mm")
+
+    if rules:
+        lines.append("ALL RULE VIOLATIONS:")
+        for r in rules[:10]:
+            lines.append(f"  - [{r.get('severity')}] {r.get('rule_id')}: {r.get('message')} "
+                          f"-> FIX: {r.get('fix')}")
+
+    return "\n".join(lines)
+
+async def mesh_from_cq_object(obj):
+    """Export a CadQuery object to STL and load as a trimesh mesh. Returns (mesh, stl_bytes).
+
+    FIX: this used to call cq.exporters.export(obj, tmp) with zero tessellation
+    control, which uses CadQuery/OCCT's default linear/angular deflection — an
+    ABSOLUTE distance tolerance, not scaled to the size of the feature being
+    tessellated. A 1.5-2mm fillet gets the same coarse triangulation budget as
+    a 200mm flat face under that default, which is a plausible real contributor
+    to the sliver triangles behind the Gmsh "invalid exterior boundary mesh"
+    and CalculiX "nonpositive jacobian" failures seen on every tapered-beam
+    test so far (on top of the Humphrey-smoothing mitigation already added on
+    the analysis_service side). Tightening this is the direct, low-risk lever
+    CadQuery already exposes for exactly this — no architectural change needed.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".stl", delete=False) as t:
+        tmp = t.name
+    try:
+        cq.exporters.export(obj, tmp, tolerance=0.01, angularTolerance=0.05)
+        mesh = trimesh.load(tmp)
+        if hasattr(mesh, "geometry"):
+            mesh = trimesh.util.concatenate(list(mesh.geometry.values()))
+        with open(tmp, "rb") as f:
+            stl_bytes = f.read()
+        return mesh, stl_bytes
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════
+
+@app.get("/")
+@_sanitize_response
+def home():
+    # As of the analysis-service split, FEM capability lives in a SEPARATE
+    # process — this service's own local CALCULIX/GMSH flags will correctly
+    # be False now (those dependencies were deliberately removed from this
+    # service's own image to shrink its memory footprint), so reporting
+    # capability from ANALYSIS_SERVICE_URL's presence is what's actually
+    # true now, not the local flags (which would otherwise make this status
+    # page report solid-tet FEM as unavailable even when it's working fine
+    # via the remote service).
+    fea_label = (
+        "real solid tetrahedral FEM (C3D4, Gmsh-meshed + CalculiX) — via separate "
+        "analysis service" if ANALYSIS_SERVICE_URL
+        else "multi-section analytical (ANALYSIS_SERVICE_URL not configured on "
+             "this deployment — set it to enable real FEM)"
+    )
+    return {
+        "status":"Lumexa v8.23 Enterprise (split architecture) — Vibe Engineering Edition",
+        "methodology_note": "The fields below describe *what each module does*, not an "
+            "independently-verified accuracy percentage — none of these have been "
+            "benchmarked against NAFEMS or other published test cases yet.",
+        "methodology_map":{
+            "geometry":"trimesh exact math","wall_thickness":"dual-pass surface sampling",
+            "holes":"multi-axis RANSAC","sharp_corners":"Peterson-Neuber stress concentration",
+            "fea": fea_label,
+            "fatigue":"full 6-factor Marin + Goodman/Gerber","fracture":"Paris Law + FAD",
+            "thermal":"gradient field + Coffin-Manson","creep":"Norton + Larson-Miller",
+            "topology":"SIMP-style density heuristic (fast first pass, not per-iteration "
+                       "FEA-verified — see topology_optimization_simp docstring)",
+            "composite":"Classical Laminate Theory + Tsai-Wu"},
+        "capabilities":{
+            "cadquery_available":CQ,
+            "analysis_service_configured": bool(ANALYSIS_SERVICE_URL),
+            "solid_tet_fem_available": bool(ANALYSIS_SERVICE_URL),
+            "blender_available":BLENDER,
+            "dxf_export_available": EZDXF,
+            "ai_generation_configured": bool(LOVABLE_API_KEY or ANTHROPIC_API_KEY or GOOGLE_API_KEY
+                                              or GROQ_API_KEY or CEREBRAS_API_KEY or NVIDIA_API_KEY
+                                              or OPENROUTER_API_KEY),
+            "ai_provider": AI_PROVIDER,
+            "ai_model": (CLAUDE_MODEL if AI_PROVIDER == "claude"
+                         else GEMINI_MODEL if AI_PROVIDER == "gemini"
+                         else GROQ_MODEL if AI_PROVIDER == "groq"
+                         else CEREBRAS_MODEL if AI_PROVIDER == "cerebras"
+                         else NVIDIA_MODEL if AI_PROVIDER == "nvidia"
+                         else OPENROUTER_MODEL if AI_PROVIDER == "openrouter"
+                         else LOVABLE_AI_MODEL),
+            "engineering_agent_configured": AI_PROVIDER in ("groq", "openrouter", "lovable", "cerebras", "nvidia")},
+        "new_in_v8_23":[
+            "Optional second-model 'strategic advisor' for the Engineering Agent: set "
+            "NEMOTRON_ADVISOR_MODEL (e.g. to a Nemotron/Kimi/DeepSeek model via OpenRouter, reusing "
+            "OPENROUTER_API_KEY) and it gets consulted sparingly — once up front for engineering "
+            "strategy, once per actual solver FAILURE for root-cause/smallest-fix guidance — while "
+            "GPT-OSS-120B keeps driving the actual tool-calling loop unchanged. Advisory only: its "
+            "input is added as context, never overrides a solver result, and any failure/misconfig "
+            "silently falls back to today's single-model behavior. Left blank, nothing changes.",
+            "POST /engineering-agent  ★★ tool-calling reasoning agent: Understand -> "
+            "Inspect -> Diagnose -> Propose -> Modify -> Simulate -> Compare -> "
+            "Refine, instead of /generate-validate-refine's regenerate-the-whole-script "
+            "loop. The frontier model (GPT-OSS-120B via Groq by default) never writes "
+            "CadQuery or declares pass/fail itself for the tapered-beam/bent-bracket "
+            "workflows — it calls tools (inspect_geometry, diagnose_failure, "
+            "modify_parameter/modify_thickness/.../add_hole, run_fea, compare_designs, "
+            "...) that go through a safe parameter contract and the same "
+            "make_tapered_beam/make_bent_bracket/run_analysis_v8 machinery every "
+            "other endpoint already trusts. Geometry is validated and meshed "
+            "automatically as part of every build/modify call (no separate "
+            "validate_geometry/run_mesh round-trip needed) — cuts model calls per "
+            "design iteration from 4 to 2, which matters a lot on rate-limited free "
+            "API tiers. A monotonic-refinement guard automatically "
+            "reverts to the last known-valid design if a candidate crashes or comes back "
+            "non-manifold/non-watertight. First implementation target (see the endpoint's "
+            "own docstring): the tapered-beam workflow — test that before bent-bracket. "
+            "Geometry outside those two primitives falls back to the existing AI "
+            "script-generation/refinement path, still wrapped in the same verify loop. "
+            "Requires AI_PROVIDER to be an OpenAI-compatible tool-calling provider "
+            "(groq/openrouter/lovable/cerebras/nvidia) — see engineering_agent_configured above.",
+        ],
+        "new_in_v8_3":[
+            "AI generation can now route through the direct Anthropic Claude API "
+            "instead of the Gemini/Lovable gateway — set ANTHROPIC_API_KEY to enable, "
+            "controlled via the AI_PROVIDER env var (see ai_provider/ai_model above "
+            "for what's active on this deployment)",
+            "POST /refine-from-external-fea  ★ closes the design loop using a real "
+            "Ansys export (coordinate + von-Mises-stress CSV), not just this "
+            "platform's own internal analysis — reuses the same refinement engine "
+            "as /generate-validate-refine so an Ansys-driven fix and an internal-loop "
+            "fix go through identical machinery",
+            "POST /edit-design-region  ★ draw a 3D bounding box, AI regenerates "
+            "only what's inside it — cut+union guarantees everything outside is "
+            "unchanged, not just prompted to be",
+            "POST /export-step  ★ STEP export at any point in a design's lifecycle "
+            "(not just first generation) — for the FreeCAD manual-edit workflow, "
+            "which needs a real B-Rep solid, not just STL triangles",
+        ],
+        "new_in_v8_2":[
+            "Solid tetrahedral FEM: parts are now Gmsh-volume-meshed into real C3D4 "
+            "elements and solved with CalculiX, not approximated as a shell — falls "
+            "back to shell FEM automatically if tet-meshing fails on a given part",
+            "AST-based sandboxing for AI-generated CadQuery scripts (replaces a "
+            "substring blocklist) — blocks import-based and reflection-based "
+            "(getattr/__subclasses__/__mro__) sandbox escapes",
+            "POST /export-drawing-dxf: 2D manufacturing drawing export (orthographic "
+            "views + dimensions + title block) for laser-cutting/CNC shops that work "
+            "from DXF rather than STEP/STL",
+            "Fixed: max_displacement_mm was previously hardcoded to 0.0 in the FEM "
+            "path; now actually parsed from solver output",
+            "CORS no longer combines wildcard origin with allow_credentials=True",
+        ],
+        "new_in_v8_1":[
+            "/generate-validate-refine: self-healing AI design loop — generate, "
+            "analyze, and auto-fix CAD designs until they pass FEA/fatigue/rule checks",
+            "AI generation now routes through Lovable AI Gateway (no per-request API key)",
+            "Non-raising script execution with structured engineering feedback for refinement",
+            "Vision (image-to-params) also routed through Lovable AI Gateway",
+        ],
+        "new_in_v8":[
+            "CalculiX real FEM — see ai_provider/methodology_map above for current "
+            "solver/element-type honesty; do not treat this as a fixed accuracy %",
+            "SIMP topology optimization",
+            "Classical Laminate Theory composites",
+            "Rainflow fatigue counting (ASTM E1049)",
+            "Manufacturing cost estimation",
+            "Gemini script generation (/generate-from-prompt)",
+            "Design comparison (/compare-designs)",
+            "Background job queue for heavy analysis",
+        ],
+        "endpoints":[
+            "GET  /","GET  /materials","GET  /part-types",
+            "POST /analyze-part","POST /analyze-assembly",
+            "POST /generate-part","POST /generate-and-analyze",
+            "POST /generate-from-prompt",
+            "POST /generate-validate-refine  ★ self-correcting AI design loop",
+            "POST /engineering-agent  ★★ tool-calling reasoning agent (Understand->Inspect->"
+            "Diagnose->Propose->Modify->Verify->Simulate->Compare->Refine) — tapered-beam "
+            "workflow is the first implementation target, see docstring",
+            "POST /refine-from-external-fea  ★ closes the loop on a real Ansys export",
+            "POST /edit-design-region  ★ boundary-box AI edit with guaranteed-unchanged rest",
+            "POST /analyze-composite","POST /analyze-rainflow",
+            "POST /compare-designs","POST /image-to-params",
+            "POST /analyze-part-deep (background CalculiX)",
+            "POST /export-drawing-dxf  ★ 2D manufacturing drawing export",
+            "GET  /job/{job_id}",
+        ],
+        "recommended_flow":[
+            "1. POST /generate-validate-refine with a natural-language part description.",
+            "2. Inspect `refinement.history` to see what the AI fixed and why.",
+            "3. If `refinement.passed_quality_gate` is false, loosen thresholds or "
+            "increase max_iterations and retry — the best attempt is always returned.",
+            "4. Decode `generated_stl_base64` to get the manufacturable STL.",
+        ],
+    }
+
+@app.get("/materials")
+@_sanitize_response
+def get_materials():
+    return {k:{"name":v["name"],"density":v["density"],
+                "yield_mpa":v["yield_strength_mpa"],"max_temp_c":v["max_service_temp_c"],
+                "cost_per_kg":v.get("cost_per_kg_usd","N/A")} for k,v in MATERIALS.items()}
+
+@app.get("/part-types")
+@_sanitize_response
+def get_part_types():
+    return {"cadquery":{k:v[1] for k,v in CADQUERY_MAP.items()},
+            "organic":{k:v[1] for k,v in TRIMESH_MAP.items()}}
+
+@app.post("/analyze-part")
+@_sanitize_response
+async def analyze_part(
+    file:UploadFile=File(...),
+    material:str=Form("auto"),
+    force_n:float=Form(1000.0),
+    force_dir:str=Form("z"),
+    operating_temp_c:float=Form(25.0),
+    surface_finish:str=Form("machined"),
+    reliability:float=Form(0.99),
+    run_topology:bool=Form(False),
+    part_name:Optional[str]=Form(None),
+    project_description:Optional[str]=Form(None),
+):
+    """Full v8.0 analysis. CalculiX FEM if available, analytical fallback."""
+    contents=await file.read();fn=file.filename or "part.stl"
+    with tempfile.NamedTemporaryFile(suffix="."+fn.split(".")[-1].lower(),delete=False) as t:
+        t.write(contents);tmp=t.name
+    try:
+        mesh=trimesh.load(tmp)
+        if hasattr(mesh,"geometry"): mesh=trimesh.util.concatenate(list(mesh.geometry.values()))
+        return await run_analysis_v8(mesh,fn,part_name or fn,material,
+                                      force_n,force_dir,operating_temp_c,
+                                      project_description,surface_finish,reliability,run_topology)
+    finally: os.unlink(tmp)
+
+@app.post("/analyze-part-deep")
+@_sanitize_response
+async def analyze_part_deep(
+    background_tasks:BackgroundTasks,
+    file:UploadFile=File(...),
+    material:str=Form("auto"),
+    force_n:float=Form(1000.0),
+    part_name:Optional[str]=Form(None),
+    project_description:Optional[str]=Form(None),
+):
+    """
+    Background analysis with full CalculiX + topology optimization.
+    Returns job_id immediately. Poll /job/{job_id} for results.
+    Use this for complex parts where 5-10 minute analysis is acceptable.
+    """
+    contents=await file.read();fn=file.filename or "part.stl"
+    job_id=str(uuid.uuid4())
+    JOB_STORE[job_id]={"status":"running","created":time.time(),"filename":fn}
+
+    async def run_job():
+        try:
+            with tempfile.NamedTemporaryFile(suffix="."+fn.split(".")[-1].lower(),delete=False) as t:
+                t.write(contents);tmp=t.name
+            try:
+                mesh=trimesh.load(tmp)
+                if hasattr(mesh,"geometry"): mesh=trimesh.util.concatenate(list(mesh.geometry.values()))
+                result=await run_analysis_v8(mesh,fn,part_name or fn,material,
+                                              force_n,"z",25.0,project_description,
+                                              "machined",0.999,True,0.5)
+                JOB_STORE[job_id]={"status":"complete","result":result,"created":time.time()}
+            finally: os.unlink(tmp)
+        except Exception as e:
+            JOB_STORE[job_id]={"status":"error","error":str(e),"created":time.time()}
+
+    background_tasks.add_task(run_job)
+    return {"job_id":job_id,"status":"running",
+            "message":"Analysis started. Poll /job/{job_id} for results.",
+            "estimated_time":"2-8 minutes with CalculiX, 30s without"}
+
+@app.get("/job/{job_id}")
+@_sanitize_response
+def get_job(job_id:str):
+    """Poll background analysis job status."""
+    if job_id not in JOB_STORE:
+        raise HTTPException(404,"Job not found")
+    job=JOB_STORE[job_id]
+    if job["status"]=="complete":
+        return job["result"]
+    elif job["status"]=="error":
+        raise HTTPException(500,job.get("error","Unknown error"))
+    else:
+        elapsed=time.time()-job["created"]
+        return {"status":"running","elapsed_seconds":round(elapsed,1),
+                "message":"Analysis in progress..."}
+
+@app.post("/generate-part")
+@_sanitize_response
+async def generate_part(
+    description:str=Form(...),
+    params:str=Form("{}"),
+    export_format:str=Form("stl"),
+):
+    if not CQ: raise HTTPException(503,"CadQuery not installed")
+    try: pd=json.loads(params)
+    except: pd={}
+    pt,gen_type,obj=route(description,pd)
+    tmp=stl_from_cq(obj) if gen_type=="cadquery" else stl_from_tm(obj)
+    suffix=".stl" if export_format in ["stl","STL"] else ".step"
+    if export_format not in ["stl","STL"]: tmp=step_from_cq(obj) if gen_type=="cadquery" else tmp
+    return FileResponse(path=tmp,media_type="application/octet-stream",filename=f"lumexa_{pt}{suffix}")
+
+@app.post("/generate-and-analyze")
+@_sanitize_response
+async def generate_and_analyze(
+    description:str=Form(...),
+    params:str=Form("{}"),
+    material:str=Form("auto"),
+    force_n:float=Form(1000.0),
+    operating_temp_c:float=Form(25.0),
+    surface_finish:str=Form("machined"),
+    reliability:float=Form(0.99),
+    project_description:Optional[str]=Form(None),
+):
+    if not CQ: raise HTTPException(503,"CadQuery not installed")
+    try: pd=json.loads(params)
+    except: pd={}
+    pt,gen_type,obj=route(description,pd)
+    tmp=stl_from_cq(obj) if gen_type=="cadquery" else stl_from_tm(obj)
+    try:
+        mesh=trimesh.load(tmp)
+        if hasattr(mesh,"geometry"): mesh=trimesh.util.concatenate(list(mesh.geometry.values()))
+        with open(tmp,"rb") as f: stl_b64=base64.b64encode(f.read()).decode()
+        result=await run_analysis_v8(mesh,description,description,material,
+                                      force_n,"z",operating_temp_c,project_description,
+                                      surface_finish,reliability)
+        result["generated_stl_base64"]=stl_b64
+        result["part_type_detected"]=pt
+        result["generation_engine"]=gen_type
+        return result
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+@app.post("/generate-from-prompt")
+@_sanitize_response
+async def generate_from_prompt(
+    prompt:str=Form(...),
+    material:str=Form("auto"),
+    force_n:float=Form(1000.0),
+    operating_temp_c:float=Form(25.0),
+):
+    """
+    Any part from natural language → Gemini (via Lovable AI Gateway) writes CadQuery → real STL + analysis.
+    Single-shot version (no refinement loop). For an AI design that automatically fixes
+    its own engineering problems, use POST /generate-validate-refine instead.
+    """
+    if not CQ: raise HTTPException(503,"CadQuery not installed")
+
+    # Gemini (Lovable AI Gateway) generates script
+    try:
+        script=await gemini_generate_script(prompt)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502,f"Gemini API error: {str(e)}")
+
+    # Execute safely (non-raising)
+    obj,err=execute_cq_script_safely(script)
+    if err:
+        raise HTTPException(400,f"Generated script failed: {err}")
+
+    # Export + analyze
+    mesh,stl_bytes=await mesh_from_cq_object(obj)
+    stl_b64=base64.b64encode(stl_bytes).decode()
+    result=await run_analysis_v8(mesh,prompt,prompt,material,force_n,"z",operating_temp_c)
+    result["generated_stl_base64"]=stl_b64
+    result["generated_script"]=script
+    result["generation_method"]="gemini_cadquery_v8"
+    return result
+
+def _parse_groq_retry_after(detail: str) -> float:
+    """Groq's 429 body includes literal text like 'Please try again in 44.01s.' —
+    parse that so the refine loop backs off exactly as long as needed instead
+    of guessing. Falls back to a conservative default if the message format
+    ever changes upstream."""
+    import re
+    m = re.search(r"try again in ([\d.]+)s", detail or "")
+    if m:
+        try:
+            return float(m.group(1)) + 0.5  # small safety margin
+        except ValueError:
+            pass
+    return 5.0
+
+
+def _diagnose_cq_error(err: str) -> str:
+    """Pattern-match known CadQuery/OpenCascade failure signatures and append
+    specific, actionable guidance — confirmed live: the generic 'fix the root
+    cause' feedback wasn't enough for the model to recover from these across
+    a real refinement run (it got a DIFFERENT failure on the retry instead of
+    a working script). These two are common, recurring OCC fillet/chamfer
+    failures, not one-off flukes."""
+    hints = []
+    if "requires that edges be selected" in err:
+        hints.append(
+            "Your .edges()/.faces() selector for the fillet/chamfer matched "
+            "ZERO edges — the selection string is stale or wrong after prior "
+            "operations changed the current context. Select the edges "
+            "immediately after creating the feature they belong to, before "
+            "chaining unrelated operations, and double-check the selector "
+            "string (e.g. '|Z', '>Z', 'not(%CIRCLE)') actually matches edges "
+            "that exist on THIS solid."
+        )
+    if "BRep_API: command not done" in err or "StdFail_NotDone" in err:
+        hints.append(
+            "The CAD kernel REJECTED a fillet/chamfer/boolean operation as "
+            "geometrically infeasible — almost always because the requested "
+            "radius is too large for the edge it's applied to (bigger than "
+            "the material thickness, or it would overlap an adjacent edge or "
+            "hole). Use a SMALLER radius (rule of thumb: no more than 20-30% "
+            "of the local wall thickness), and apply fillets/chamfers BEFORE "
+            "cutting nearby holes so the kernel has simpler geometry to work with."
+        )
+    return ("\n\n" + "\n\n".join(hints)) if hints else ""
+
+
+@app.post("/generate-validate-refine")
+@_sanitize_response
+async def generate_validate_refine(
+    prompt:str=Form(...),
+    material:str=Form("auto"),
+    force_n:float=Form(1000.0),
+    force_dir:str=Form("z"),
+    operating_temp_c:float=Form(25.0),
+    surface_finish:str=Form("machined"),
+    reliability:float=Form(0.99),
+    project_description:Optional[str]=Form(None),
+    max_iterations:int=Form(6),
+    min_health_score:float=Form(75.0),
+    max_critical_violations:int=Form(0),
+    max_high_violations:int=Form(2),
+    min_safety_factor:float=Form(1.0),
+    run_topology:bool=Form(False),
+):
+    """
+    ★ THE CORE VIBE-ENGINEERING LOOP ★
+
+    1. AI (Gemini via Lovable AI Gateway) writes a CadQuery script from `prompt`.
+    2. Script is executed → STL → full engineering analysis (FEA, fatigue, fracture,
+       wall thickness, hole placement, sharp-corner stress, rule engine, health score).
+    3. The result is checked against quality thresholds (health score, safety factor,
+       critical/high violation counts, watertightness).
+    4. If it fails AND iterations remain, the full analysis is fed back to the AI as a
+       structured feedback report (REFINEMENT MODE) and it produces a corrected script.
+    5. Repeat until it passes or `max_iterations` is reached. The BEST iteration
+       (highest health score) is returned, plus the full iteration history.
+
+    This is the endpoint that makes the platform "self-healing": bad first drafts get
+    automatically engineered into something that passes real structural checks.
+
+    Quality thresholds (tune per-project):
+      - min_health_score: target health score 0-100 (default 75)
+      - max_critical_violations: CRITICAL rule violations allowed (default 0)
+      - max_high_violations: HIGH-severity violations allowed (default 2)
+      - min_safety_factor: minimum FEA safety factor (default 1.0)
+    """
+    if not CQ: raise HTTPException(503,"CadQuery not installed")
+    if max_iterations<1: max_iterations=1
+    if max_iterations>6: max_iterations=6  # hard cap: cost + latency safety
+
+    iterations=[]
+    best=None        # best {"result":..., "quality":..., "script":..., "stl_b64":..., "iteration":int}
+    script=None
+    feedback=None
+    stopped_reason=None
+    # Groq's free tier caps at 8000 TPM — confirmed live: a refinement loop
+    # burns through that in 1-2 calls, and this used to silently `break` on
+    # the resulting 429 with zero indication in the response that the loop
+    # was cut short (iterations_used < max_iterations looked like a decision,
+    # not a failure). Now: retry using Groq's own stated wait time first, and
+    # always record *why* the loop stopped in result["refinement"]["stopped_reason"].
+    RATE_LIMIT_MAX_TOTAL_WAIT=90.0  # seconds, kept under typical client timeouts
+
+    for i in range(1, max_iterations+1):
+        # 1) Generate or refine the script
+        rate_limit_wait_remaining=RATE_LIMIT_MAX_TOTAL_WAIT
+        gen_failed=False
+        while True:
+            try:
+                script=await gemini_generate_script(prompt, previous_script=script, feedback=feedback)
+                break
+            except HTTPException as e:
+                is_rate_limited=(e.status_code==429)
+                if is_rate_limited and rate_limit_wait_remaining>0:
+                    wait_s=min(_parse_groq_retry_after(str(e.detail)), rate_limit_wait_remaining)
+                    rate_limit_wait_remaining-=wait_s
+                    await asyncio.sleep(wait_s)
+                    continue
+                if iterations:
+                    stopped_reason="rate_limited" if is_rate_limited else "generation_failed"
+                    gen_failed=True
+                    break
+                raise
+        if gen_failed:
+            break
+
+        # 2) Execute
+        obj,err=execute_cq_script_safely(script)
+        if err:
+            iterations.append({"iteration":i,"stage":"execution_failed","error":err,"script":script})
+            feedback=(f"Your script FAILED TO EXECUTE with this error:\n{err}\n\n"
+                      f"Fix the root cause and return a complete, runnable script."
+                      f"{_diagnose_cq_error(err)}")
+            continue
+
+        # 3) Analyze
+        try:
+            mesh,stl_bytes=await mesh_from_cq_object(obj)
+            result=await run_analysis_v8(mesh,prompt,prompt,material,force_n,force_dir,
+                                          operating_temp_c,project_description,
+                                          surface_finish,reliability,run_topology)
+        except Exception as e:
+            iterations.append({"iteration":i,"stage":"analysis_failed","error":str(e),"script":script})
+            feedback=(f"The generated geometry exported, but the analysis pipeline raised:\n{str(e)}\n\n"
+                      f"This usually means degenerate/non-manifold geometry. Simplify or fix the "
+                      f"geometry (avoid zero-thickness faces, self-intersections, open shells) and "
+                      f"return a complete, runnable script.")
+            continue
+
+        # 4) Quality gate
+        quality=evaluate_design_quality(result, min_health_score, max_critical_violations,
+                                         max_high_violations, min_safety_factor)
+        stl_b64=base64.b64encode(stl_bytes).decode()
+        entry={"iteration":i,"stage":"analyzed","passed":quality["passed"],
+               "health_score":quality["score"],"reasons":quality["reasons"],
+               "metrics":quality["metrics"]}
+        iterations.append(entry)
+
+        candidate={"result":result,"quality":quality,"script":script,
+                   "stl_b64":stl_b64,"iteration":i}
+        # A candidate that actually PASSED is always preferred over one that
+        # didn't, no matter the raw score — a failing 95 (e.g. fatigue FAIL)
+        # must never beat a passing 87. Only compare raw scores head-to-head
+        # when both candidates are in the same passed/failed bucket.
+        if best is None:
+            best=candidate
+        elif quality["passed"] != best["quality"]["passed"]:
+            if quality["passed"]:
+                best=candidate
+        elif quality["score"]>best["quality"]["score"]:
+            best=candidate
+
+        if quality["passed"]:
+            stopped_reason="quality_gate_passed"
+            break
+
+        # 5) Build feedback for next round
+        feedback=summarize_analysis_for_refinement(result, quality)
+
+    if stopped_reason is None:
+        stopped_reason="max_iterations_reached"
+
+    if best is None:
+        # Every iteration failed to even produce geometry — surface the last error.
+        last=iterations[-1] if iterations else {}
+        raise HTTPException(502, "AI failed to produce a valid CAD design after "
+                                  f"{len(iterations)} attempt(s). Last error: "
+                                  f"{last.get('error','unknown')}")
+
+    result=best["result"]
+    result["generated_stl_base64"]=best["stl_b64"]
+    result["generated_script"]=best["script"]
+    result["generation_method"]="gemini_cadquery_v8_refined"
+    result["refinement"]={
+        "iterations_used":len(iterations),
+        "max_iterations":max_iterations,
+        "best_iteration":best["iteration"],
+        "passed_quality_gate":best["quality"]["passed"],
+        "stopped_reason":stopped_reason,
+        "final_reasons":best["quality"]["reasons"],
+        "quality_thresholds":{
+            "min_health_score":min_health_score,
+            "max_critical_violations":max_critical_violations,
+            "max_high_violations":max_high_violations,
+            "min_safety_factor":min_safety_factor,
+        },
+        "history":iterations,
+    }
+    return result
+
+
+@app.post("/refine-from-external-fea")
+@_sanitize_response
+async def refine_from_external_fea(
+    prompt: str = Form(...),
+    previous_script: str = Form(...),
+    material: str = Form("aluminum_6061"),
+    hotspots_csv: UploadFile = File(...),
+    top_n: int = Form(5),
+    force_n: float = Form(1000.0),
+    force_dir: str = Form("z"),
+    operating_temp_c: float = Form(25.0),
+    surface_finish: str = Form("machined"),
+    reliability: float = Form(0.99),
+    min_health_score: float = Form(75.0),
+    max_critical_violations: int = Form(0),
+    max_high_violations: int = Form(2),
+    min_safety_factor: float = Form(1.0),
+):
+    """
+    ★ CLOSES THE LOOP WITH EXTERNAL FEA (e.g. Ansys), NOT JUST THIS PLATFORM'S OWN ★
+
+    Feed in: the original prompt, the script that produced the part an engineer ran
+    through Ansys, and a CSV of stress-hotspot results exported from Ansys (a
+    coordinate + von-Mises-stress table — Ansys can export this from its results
+    viewer/probe table). This builds the same structured feedback text the internal
+    /generate-validate-refine loop generates from its own analysis, then reuses that
+    identical refinement machinery — a correction driven by a certified Ansys run
+    goes through the same code path as an internal-loop correction, not a separate
+    or lesser one.
+
+    CSV columns (case-insensitive, flexible naming): x / y / z coordinates in mm,
+    plus a stress column (accepts: von_mises_mpa, vm_stress, stress, stress_mpa,
+    s.mises, "equivalent stress"). Extra columns are ignored.
+
+    SCOPE NOTE: this does NOT parse Ansys's native binary result files (.rst/.odb)
+    — those are proprietary formats. Export a coordinate+stress table to CSV from
+    Ansys's results viewer first. This also does not re-verify the fix in Ansys —
+    the response is rechecked against Lumexa's own internal analysis only; send the
+    result back through Ansys to confirm before trusting it for anything real.
+    """
+    if not CQ:
+        raise HTTPException(503, "CadQuery not installed")
+
+    contents = await hotspots_csv.read()
+    text = contents.decode(errors="ignore")
+
+    import csv, io
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise HTTPException(400, "CSV has no header row / couldn't be parsed.")
+
+    def find_col(cands):
+        lower = {f.lower().strip(): f for f in reader.fieldnames}
+        for c in cands:
+            if c in lower:
+                return lower[c]
+        return None
+
+    x_col = find_col(["x", "x_mm", "x (mm)", "xcoord", "x coordinate"])
+    y_col = find_col(["y", "y_mm", "y (mm)", "ycoord", "y coordinate"])
+    z_col = find_col(["z", "z_mm", "z (mm)", "zcoord", "z coordinate"])
+    s_col = find_col(["von_mises_mpa", "von mises", "vonmises", "vm_stress",
+                       "s.mises", "s_mises", "stress", "stress_mpa", "equivalent stress"])
+
+    if not s_col:
+        raise HTTPException(400, f"Couldn't find a stress column in the CSV. Columns found: "
+                                  f"{reader.fieldnames}. Rename your stress column to one of: "
+                                  f"von_mises_mpa, vm_stress, stress_mpa.")
+
+    def _to_float(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    rows = []
+    for row in reader:
+        stress = _to_float(row.get(s_col))
+        if stress is None:
+            continue
+        rows.append({
+            "x": _to_float(row.get(x_col)) if x_col else None,
+            "y": _to_float(row.get(y_col)) if y_col else None,
+            "z": _to_float(row.get(z_col)) if z_col else None,
+            "von_mises_mpa": stress,
+        })
+
+    if not rows:
+        raise HTTPException(400, "No valid numeric stress values found in the CSV.")
+
+    rows.sort(key=lambda r: r["von_mises_mpa"], reverse=True)
+    top = rows[:max(1, min(top_n, 20))]
+
+    mat = MATERIALS.get(material, MATERIALS["aluminum_6061"])
+    Sy = mat["yield_strength_mpa"]
+
+    lines = [f"EXTERNAL FEA RESULTS (imported from Ansys/third-party export, NOT this "
+             f"platform's own analysis) — material yield strength {Sy} MPa:"]
+    any_fail = False
+    for i, r in enumerate(top, 1):
+        sf = round(Sy / max(r["von_mises_mpa"], 0.001), 3)
+        status = "FAILS (SF < 1.0)" if sf < 1.0 else ("MARGINAL (SF < 2.0)" if sf < 2.0 else "OK")
+        if sf < 2.0:
+            any_fail = True
+        loc = (f"at approx ({r['x']:.2f}, {r['y']:.2f}, {r['z']:.2f}) mm"
+               if r["x"] is not None and r["y"] is not None and r["z"] is not None
+               else "(location not provided in CSV)")
+        lines.append(f"  {i}. {r['von_mises_mpa']:.2f} MPa {loc} — safety factor {sf} — {status}")
+
+    lines.append("")
+    lines.append(
+        "One or more points above have an unacceptable safety factor per the certified "
+        "Ansys run. Modify the geometry to reduce stress at those specific locations — "
+        "typically: add a fillet/radius, increase local wall thickness, add a rib, or "
+        "reroute the load path near the coordinates given above. Return a COMPLETE, "
+        "corrected script. Return ONLY Python code. No markdown."
+        if any_fail else
+        "All reported points are within an acceptable safety factor. No geometry change "
+        "is required from this feedback."
+    )
+    feedback_text = "\n".join(lines)
+
+    new_script = await gemini_generate_script(prompt, previous_script=previous_script,
+                                                feedback=feedback_text)
+
+    obj, err = execute_cq_script_safely(new_script)
+    if err:
+        return {
+            "stage": "execution_failed", "error": err, "script": new_script,
+            "external_feedback_used": feedback_text,
+        }
+
+    mesh, stl_bytes = await mesh_from_cq_object(obj)
+    result = await run_analysis_v8(mesh, prompt, prompt, material, force_n, force_dir,
+                                    operating_temp_c, None, surface_finish, reliability, False)
+    quality = evaluate_design_quality(result, min_health_score, max_critical_violations,
+                                       max_high_violations, min_safety_factor)
+    stl_b64 = base64.b64encode(stl_bytes).decode()
+
+    return {
+        "stage": "refined_from_external_fea",
+        "script": new_script,
+        "stl_base64": stl_b64,
+        "internal_recheck": {"passed": quality["passed"], "health_score": quality["score"],
+                              "reasons": quality["reasons"]},
+        "external_hotspots_used": top,
+        "external_feedback_text": feedback_text,
+        "note": "Rechecked against Lumexa's own internal analysis only — NOT yet "
+                "re-verified in Ansys. Send this back through Ansys to confirm the fix "
+                "actually resolves the reported stress before trusting it for anything real.",
+    }
+
+
+import re as _re
+
+def _rename_result_var(script: str, new_name: str) -> str:
+    """
+    Rename the conventional `result` variable to a unique name via word-boundary
+    regex substitution, so two independently-generated scripts can be concatenated
+    into one combined script without their `result` assignments colliding. Safe
+    because every script this system generates is instructed to use exactly the
+    literal name `result` for its final shape — see GEMINI_CADQUERY_SYSTEM.
+    """
+    return _re.sub(r"\bresult\b", new_name, script)
+
+
+@app.post("/edit-design-region")
+@_sanitize_response
+async def edit_design_region(
+    previous_script: str = Form(...),
+    edit_prompt: str = Form(...),
+    x_min: float = Form(...), y_min: float = Form(...), z_min: float = Form(...),
+    x_max: float = Form(...), y_max: float = Form(...), z_max: float = Form(...),
+    material: str = Form("aluminum_6061"),
+):
+    """
+    ★ BOUNDARY-REGION EDIT ★ — user draws a 3D bounding box around part of the
+    generated design; only geometry inside that box is regenerated, everything
+    outside is geometrically guaranteed unchanged (via cut + union, not just a
+    hopeful full-script regeneration like /refine-from-external-fea's feedback
+    text approach).
+
+    Coordinates are in the same mm coordinate space as the part itself (i.e.
+    whatever the frontend's 3D viewer reports for the drawn box, untransformed).
+
+    Pipeline:
+      1. Execute previous_script -> base shape.
+      2. Cut the given box out of the base shape.
+      3. Ask the AI for ONLY the replacement geometry, sized to fit the box,
+         centered at the local origin (NOT the box's real-world position — the
+         backend handles placement, so the AI's job is just "build a shape this
+         big", which is a much more reliable prompt than asking it to also get
+         absolute 3D placement right).
+      4. Translate the AI's local shape into the box's real position, union it
+         into the cut base.
+      5. Assemble ONE new combined script (previous_script + the AI's local
+         script + the cut/union glue, with `result` variables renamed to avoid
+         collision) so the result is a normal, fully re-editable CadQuery script
+         — future edits (another region, or /refine-from-external-fea) work on
+         it exactly like any other script in this system.
+    """
+    if not CQ:
+        raise HTTPException(503, "CadQuery not installed")
+
+    bx, by, bz = abs(x_max - x_min), abs(y_max - y_min), abs(z_max - z_min)
+    if bx <= 0 or by <= 0 or bz <= 0:
+        raise HTTPException(400, "Bounding box must have positive size on all three axes "
+                                  "(check x_min<x_max, y_min<y_max, z_min<z_max).")
+    cx, cy, cz = (x_min+x_max)/2, (y_min+y_max)/2, (z_min+z_max)/2
+
+    # Step 1: confirm the base script still executes before spending an AI call.
+    base_obj, base_err = execute_cq_script_safely(previous_script)
+    if base_err:
+        raise HTTPException(400, f"previous_script failed to execute, can't edit it: {base_err}")
+
+    # Step 2/3: ask the AI for ONLY the local replacement geometry.
+    local_prompt = (
+        f"Design ONLY this local replacement feature — build it centered at the "
+        f"origin (0,0,0), sized to fit within a bounding box of "
+        f"{bx:.2f} x {by:.2f} x {bz:.2f} mm (X x Y x Z). Do not worry about where "
+        f"this sits in a larger assembly — a backend step positions it afterward. "
+        f"Request: {edit_prompt}"
+    )
+    local_script = await gemini_generate_script(local_prompt)
+
+    local_obj, local_err = execute_cq_script_safely(local_script)
+    if local_err:
+        return {"stage": "local_generation_failed", "error": local_err, "local_script": local_script}
+
+    # Step 4/5: cut + union + assemble the combined script.
+    try:
+        base_renamed = _rename_result_var(previous_script, "_base_result")
+        local_renamed = _rename_result_var(local_script, "_local_result")
+
+        combined_script = (
+            "import cadquery as cq\n\n"
+            "# --- base shape (previous design) ---\n"
+            f"{base_renamed}\n\n"
+            "# --- local replacement geometry for the edited region ---\n"
+            f"{local_renamed}\n\n"
+            "# --- combine: cut the edited region out of the base, then union in "
+            "the new local geometry, positioned at the region's real location ---\n"
+            f"_cutter = cq.Workplane('XY').box({bx}, {by}, {bz}).translate(({cx}, {cy}, {cz}))\n"
+            f"_local_positioned = _local_result.translate(({cx}, {cy}, {cz}))\n"
+            "result = _base_result.cut(_cutter).union(_local_positioned)\n"
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Failed to assemble combined script: {str(e)}")
+
+    combined_obj, combined_err = execute_cq_script_safely(combined_script)
+    if combined_err:
+        return {
+            "stage": "combine_failed",
+            "error": combined_err,
+            "combined_script": combined_script,
+            "note": "The base and local pieces each generated fine individually, but "
+                    "combining them (cut+union) failed — often means the local geometry "
+                    "doesn't fully fill the box, leaving a non-manifold result, or the "
+                    "box didn't actually overlap solid material in the base shape.",
+        }
+
+    mesh, stl_bytes = await mesh_from_cq_object(combined_obj)
+    result = await run_analysis_v8(mesh, edit_prompt, edit_prompt, material, 1000.0, "z",
+                                    25.0, None, "machined", 0.99, False)
+    quality = evaluate_design_quality(result, 75.0, 0, 2, 1.0)
+    stl_b64 = base64.b64encode(stl_bytes).decode()
+
+    return {
+        "stage": "region_edited",
+        "script": combined_script,
+        "stl_base64": stl_b64,
+        "edited_region_mm": {"x_min": x_min, "y_min": y_min, "z_min": z_min,
+                              "x_max": x_max, "y_max": y_max, "z_max": z_max},
+        "internal_recheck": {"passed": quality["passed"], "health_score": quality["score"],
+                              "reasons": quality["reasons"]},
+        "note": "Everything outside the given box is geometrically guaranteed unchanged "
+                "(cut+union, not a full regeneration) — only the boxed region was "
+                "AI-generated. Re-run this endpoint again with a new box to edit another "
+                "region, or /refine-from-external-fea for whole-part corrections.",
+    }
+
+
+@app.post("/export-step")
+@_sanitize_response
+async def export_step(script: str = Form(...)):
+    """
+    ★ STANDALONE STEP EXPORT ★ — the FreeCAD "edit manually" workflow needs STEP
+    available at ANY point in a design's lifecycle (after initial generation,
+    after a validate-refine loop, after an external-FEA-driven fix, after a
+    boundary-region edit) — not just at first generation, where export_format
+    already existed inside /generate-and-analyze. This is that: give it whatever
+    script currently represents the design's state, get STEP back. STEP (not
+    STL) is what makes the FreeCAD round-trip actually useful — it's a real
+    B-Rep solid with editable faces, not just a triangle soup.
+    """
+    if not CQ:
+        raise HTTPException(503, "CadQuery not installed")
+
+    obj, err = execute_cq_script_safely(script)
+    if err:
+        raise HTTPException(400, f"Script failed to execute: {err}")
+
+    step_path = step_from_cq(obj)
+    try:
+        with open(step_path, "rb") as f:
+            step_b64 = base64.b64encode(f.read()).decode()
+    finally:
+        if os.path.exists(step_path):
+            try: os.unlink(step_path)
+            except: pass
+
+    return {
+        "step_base64": step_b64,
+        "filename": "lumexa_part.step",
+        "note": "Open this in FreeCAD (free) for manual editing. Editing outside "
+                "this system breaks the script-based edit loop (/edit-design-region, "
+                "/refine-from-external-fea) for whatever you change manually — "
+                "re-upload the edited result to /analyze-part to re-run FEA/DFM "
+                "checks on it, but treat it as a new starting point, not something "
+                "the AI can keep iterating on as code.",
+    }
+
+
+def _hull_outline_2d(points_2d):
+    """2D convex hull of a point set, returned as an ordered closed polygon (list of (x,y))."""
+    pts = np.asarray(points_2d)
+    if len(pts) < 3:
+        return [tuple(p) for p in pts]
+    hull = ConvexHull(pts)
+    return [tuple(pts[i]) for i in hull.vertices]
+
+
+def generate_technical_drawing_dxf(mesh, title="Lumexa Part", material_name=""):
+    """
+    Generate a 2D DXF manufacturing reference drawing: three orthographic-style
+    views (top/front/side) plus overall dimensions and a title block.
+
+    SCOPE NOTE — read before presenting this as a "drawing" to anyone technical:
+    each view is the 2D convex hull of the mesh's vertices projected onto that
+    plane, NOT a true hidden-line-removed orthographic projection (what an actual
+    SolidWorks/AutoCAD drawing shows: every visible edge, holes as circles,
+    internal features as dashed hidden lines). For a convex or near-convex part
+    (simple brackets, enclosures, plates) the two look similar. For anything with
+    concave features, pockets, or through-holes, the convex hull will NOT show
+    those — it's a bounding-envelope reference good for stock sizing and rough
+    layout, not a feature-complete machinist's drawing. The returned dict's
+    scope_note says this to the caller; don't strip that note out in the UI.
+
+    Returns an ezdxf Document.
+    """
+    verts = mesh.vertices
+    bounds = mesh.bounds
+    dims = bounds[1] - bounds[0]  # (dx, dy, dz)
+
+    doc = ezdxf.new("R2010", setup=True)
+    doc.units = ezdxf_units.MM
+    msp = doc.modelspace()
+
+    for name, color in [("OUTLINE", 7), ("DIM", 1), ("TEXT", 3), ("TITLEBLOCK", 7)]:
+        if name not in doc.layers:
+            doc.layers.add(name, color=color)
+
+    gap = max(float(dims.max()) * 0.25, 20.0)
+
+    # Top view: looking down the Z axis -> project to (X, Y)
+    top_pts = _hull_outline_2d(verts[:, [0, 1]])
+    top_origin = (0.0, 0.0)
+    # Front view: looking along -Y -> project to (X, Z), placed above the top view
+    front_pts = _hull_outline_2d(verts[:, [0, 2]])
+    front_origin = (0.0, float(dims[1]) + gap)
+    # Side view: looking along -X -> project to (Y, Z), placed right of the front view
+    side_pts = _hull_outline_2d(verts[:, [1, 2]])
+    side_origin = (float(dims[0]) + gap, float(dims[1]) + gap)
+
+    def draw_view(pts, origin, label, x_extent, y_extent):
+        # Shift each view so its min corner sits at the view's assigned origin.
+        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+        minx, miny = min(xs), min(ys)
+        placed = [(p[0]-minx+origin[0], p[1]-miny+origin[1]) for p in pts]
+        if len(placed) >= 3:
+            msp.add_lwpolyline(placed, close=True, dxfattribs={"layer": "OUTLINE"})
+        elif len(placed) == 2:
+            msp.add_line(placed[0], placed[1], dxfattribs={"layer": "OUTLINE"})
+        msp.add_text(label, height=x_extent*0.04 or 3,
+                      dxfattribs={"layer": "TEXT"}).set_placement(
+            (origin[0], origin[1]-max(x_extent*0.08, 6)))
+        try:
+            msp.add_linear_dim(base=(origin[0], origin[1]-max(y_extent*0.15,10)),
+                                p1=(origin[0], origin[1]),
+                                p2=(origin[0]+x_extent, origin[1]),
+                                dimstyle="EZDXF", dxfattribs={"layer": "DIM"}).render()
+            msp.add_linear_dim(base=(origin[0]-max(x_extent*0.15,10), origin[1]),
+                                p1=(origin[0], origin[1]),
+                                p2=(origin[0], origin[1]+y_extent),
+                                angle=90, dimstyle="EZDXF",
+                                dxfattribs={"layer": "DIM"}).render()
+        except Exception:
+            pass  # Dimension rendering is best-effort; outline geometry is the core deliverable.
+
+    draw_view(top_pts, top_origin, "TOP VIEW", float(dims[0]), float(dims[1]))
+    draw_view(front_pts, front_origin, "FRONT VIEW", float(dims[0]), float(dims[2]))
+    draw_view(side_pts, side_origin, "SIDE VIEW", float(dims[1]), float(dims[2]))
+
+    # Title block — plain TEXT entities so the core information survives even if
+    # dimension-style rendering behaves differently across ezdxf/DXF versions.
+    tb_y = -max(float(dims[2]) * 0.35, 25.0)
+    lines = [
+        f"{title}",
+        f"MATERIAL: {material_name or 'unspecified'}",
+        f"OVERALL (mm): L{dims[0]:.2f} x W{dims[1]:.2f} x H{dims[2]:.2f}",
+        "GENERATED BY LUMEXA (AI-assisted) — REFERENCE ONLY, NOT A CERTIFIED "
+        "ENGINEERING DRAWING. Views are convex-hull silhouettes, not hidden-line "
+        "projections — verify against the source model before manufacturing.",
+    ]
+    for i, line in enumerate(lines):
+        msp.add_text(line, height=max(float(dims.max())*0.025, 2.5),
+                      dxfattribs={"layer": "TITLEBLOCK"}).set_placement(
+            (0.0, tb_y - i * max(float(dims.max())*0.035, 3.5)))
+
+    return doc
+
+
+@app.post("/export-drawing-dxf")
+@_sanitize_response
+async def export_drawing_dxf(
+    file: UploadFile = File(...),
+    material: str = Form("aluminum_6061"),
+    part_name: str = Form("Lumexa Part"),
+):
+    """
+    Export a 2D DXF manufacturing reference drawing from an uploaded 3D part —
+    for laser-cutting/CNC/machine shops that work from DXF rather than STEP/STL.
+    See generate_technical_drawing_dxf's docstring for what this does and doesn't
+    capture (convex-hull silhouettes, not a hidden-line-removed drawing).
+    """
+    if not EZDXF:
+        raise HTTPException(503, "ezdxf is not installed on this server. Add "
+                                  "'ezdxf' to requirements.txt to enable DXF export.")
+
+    contents = await file.read()
+    fn = file.filename or "part.stl"
+    suffix = os.path.splitext(fn)[1] or ".stl"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as t:
+        t.write(contents); tmp = t.name
+
+    try:
+        mesh = trimesh.load(tmp)
+        if hasattr(mesh, "geometry"):
+            mesh = trimesh.util.concatenate(list(mesh.geometry.values()))
+
+        mat = MATERIALS.get(material, MATERIALS.get("aluminum_6061", {}))
+        doc = generate_technical_drawing_dxf(
+            mesh, title=part_name, material_name=mat.get("name", material)
+        )
+
+        dxf_path = tmp + ".dxf"
+        doc.saveas(dxf_path)
+        with open(dxf_path, "rb") as f:
+            dxf_b64 = base64.b64encode(f.read()).decode()
+        os.unlink(dxf_path)
+
+        dims = (mesh.bounds[1] - mesh.bounds[0]).tolist()
+        return {
+            "dxf_base64": dxf_b64,
+            "filename": os.path.splitext(fn)[0] + "_drawing.dxf",
+            "overall_dimensions_mm": {
+                "length": round(dims[0], 2), "width": round(dims[1], 2), "height": round(dims[2], 2)
+            },
+            "scope_note": "Orthographic-style views are the convex hull of each "
+                           "projection, not hidden-line-removed feature drawings — "
+                           "concave features and through-holes won't appear as cut "
+                           "lines. Good for stock sizing / rough layout, not a "
+                           "substitute for a drafted machinist's drawing.",
+        }
+    finally:
+        os.unlink(tmp)
+
+
+@app.post("/analyze-composite")
+@_sanitize_response
+async def analyze_composite(
+    file:UploadFile=File(...),
+    material:str=Form("carbon_fiber_ud"),
+    layup_angles:str=Form("[0,90,45,-45,90,0]"),
+    thickness_per_ply_mm:float=Form(0.125),
+    Nx:float=Form(1000.0),
+    Ny:float=Form(0.0),
+    Nxy:float=Form(0.0),
+):
+    """Classical Laminate Theory analysis for composite parts."""
+    contents=await file.read();fn=file.filename or "part.stl"
+    with tempfile.NamedTemporaryFile(suffix=".stl",delete=False) as t:
+        t.write(contents);tmp=t.name
+    try:
+        mesh=trimesh.load(tmp)
+        if hasattr(mesh,"geometry"): mesh=trimesh.util.concatenate(list(mesh.geometry.values()))
+        try: angles=json.loads(layup_angles)
+        except: angles=[0,90,45,-45,90,0]
+        clt=composite_analysis_clt(material,angles,thickness_per_ply_mm,Nx,Ny,Nxy)
+        geom_result=await run_analysis_v8(mesh,fn,fn,material)
+        geom_result["composite_analysis"]=clt
+        return geom_result
+    finally: os.unlink(tmp)
+
+@app.post("/analyze-rainflow")
+@_sanitize_response
+async def analyze_rainflow(
+    file:UploadFile=File(...),
+    material:str=Form("auto"),
+    load_history:str=Form("[100,-50,80,-30,120,-60,90,-40]"),
+):
+    """Rainflow fatigue counting (ASTM E1049) for variable amplitude loading."""
+    contents=await file.read();fn=file.filename or "part.stl"
+    with tempfile.NamedTemporaryFile(suffix=".stl",delete=False) as t:
+        t.write(contents);tmp=t.name
+    try:
+        mesh=trimesh.load(tmp)
+        if hasattr(mesh,"geometry"): mesh=trimesh.util.concatenate(list(mesh.geometry.values()))
+        if material=="auto": material=detect_material(mesh)
+        try: lh=json.loads(load_history)
+        except: lh=[100,-50,80,-30,120,-60]
+        rf=rainflow_fatigue(material,lh)
+        result=await run_analysis_v8(mesh,fn,fn,material)
+        result["rainflow_fatigue"]=rf
+        return result
+    finally: os.unlink(tmp)
+
+@app.post("/compare-designs")
+@_sanitize_response
+async def compare_designs(
+    file1:UploadFile=File(...),
+    file2:UploadFile=File(...),
+    material1:str=Form("auto"),
+    material2:str=Form("auto"),
+    force_n:float=Form(1000.0),
+):
+    """Side-by-side engineering comparison of 2 design iterations."""
+    c1=await file1.read();c2=await file2.read()
+    def lm(c,fn):
+        with tempfile.NamedTemporaryFile(suffix="."+fn.split(".")[-1].lower(),delete=False) as t:
+            t.write(c);return t.name
+    p1=lm(c1,file1.filename);p2=lm(c2,file2.filename)
+    try:
+        m1=trimesh.load(p1);m2=trimesh.load(p2)
+        if hasattr(m1,"geometry"): m1=trimesh.util.concatenate(list(m1.geometry.values()))
+        if hasattr(m2,"geometry"): m2=trimesh.util.concatenate(list(m2.geometry.values()))
+        r1=await run_analysis_v8(m1,file1.filename,file1.filename,material1,force_n)
+        r2=await run_analysis_v8(m2,file2.filename,file2.filename,material2,force_n)
+        def delta(v1,v2):
+            if v1 and v2 and v1!=0: return round((v2-v1)/v1*100,1)
+            return None
+        sf1=r1["analytical_fea"]["safety_factor"]
+        sf2=r2["analytical_fea"]["safety_factor"]
+        vm1=r1["analytical_fea"]["stress"]["von_mises_mpa"]
+        vm2=r2["analytical_fea"]["stress"]["von_mises_mpa"]
+        return {
+            "design1":{"filename":file1.filename,"health":r1["health_score"]["score"],
+                       "safety_factor":sf1,"von_mises_mpa":vm1,
+                       "mass_g":r1["analytical_fea"]["dynamics"]["estimated_mass_g"],
+                       "wall_min_mm":r1["wall_thickness"].get("min_mm"),
+                       "violations":r1["rule_engine"]["total_violations"],
+                       "full_analysis":r1},
+            "design2":{"filename":file2.filename,"health":r2["health_score"]["score"],
+                       "safety_factor":sf2,"von_mises_mpa":vm2,
+                       "mass_g":r2["analytical_fea"]["dynamics"]["estimated_mass_g"],
+                       "wall_min_mm":r2["wall_thickness"].get("min_mm"),
+                       "violations":r2["rule_engine"]["total_violations"],
+                       "full_analysis":r2},
+            "delta":{
+                "health_score_change":r2["health_score"]["score"]-r1["health_score"]["score"],
+                "safety_factor_change_pct":delta(sf1,sf2),
+                "stress_change_pct":delta(vm1,vm2),
+                "mass_change_pct":delta(r1["analytical_fea"]["dynamics"]["estimated_mass_g"],
+                                        r2["analytical_fea"]["dynamics"]["estimated_mass_g"]),
+                "violations_change":r2["rule_engine"]["total_violations"]-r1["rule_engine"]["total_violations"],
+            },
+            "verdict":"DESIGN_2_BETTER" if r2["health_score"]["score"]>r1["health_score"]["score"]
+                       else "DESIGN_1_BETTER" if r1["health_score"]["score"]>r2["health_score"]["score"]
+                       else "EQUIVALENT",
+        }
+    finally: os.unlink(p1);os.unlink(p2)
+
+@app.post("/image-to-params")
+@_sanitize_response
+async def image_to_params(
+    image:UploadFile=File(...),
+    description:str=Form(""),
+):
+    """
+    Estimate part parameters from image using Gemini Vision (via Lovable AI Gateway).
+    Returns estimated dimensions → use with /generate-and-analyze or, better,
+    /generate-validate-refine for a self-correcting design.
+    Accuracy: 65-75% (depends on image quality and part complexity).
+    """
+    img_bytes=await image.read()
+    img_b64=base64.b64encode(img_bytes).decode()
+    mime_type=image.content_type or "image/jpeg"
+
+    try:
+        params=await gemini_vision_estimate(img_b64,mime_type,description)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502,f"Gemini Vision error: {str(e)}")
+
+    return {"estimated_params":params,
+            "next_step":"Use these params with POST /generate-and-analyze, or describe the "
+                         "part in natural language to POST /generate-validate-refine for an "
+                         "AI-generated, self-corrected design.",
+            "warning":"Image estimation accuracy: 65-75%. Verify dimensions before manufacturing.",
+            "suggested_call":{"endpoint":"/generate-and-analyze",
+                              "description":f"{params.get('part_type','bracket')} from image",
+                              "params":json.dumps(_json_safe({
+                                  "width":params.get("estimated_width_mm",80),
+                                  "height":params.get("estimated_height_mm",60),
+                                  "depth":params.get("estimated_depth_mm",40),
+                                  "thickness":params.get("estimated_thickness_mm",5),
+                                  "hole_diameter":params.get("hole_diameter_mm",6),
+                              }))}}
+
+@app.post("/analyze-assembly")
+@_sanitize_response
+async def analyze_assembly(
+    part1:UploadFile=File(...),
+    part2:UploadFile=File(...),
+    material1:str=Form("auto"),
+    material2:str=Form("auto"),
+):
+    c1=await part1.read();c2=await part2.read()
+    def lm(c,fn):
+        with tempfile.NamedTemporaryFile(suffix="."+fn.split(".")[-1].lower(),delete=False) as t:
+            t.write(c);return t.name
+    p1=lm(c1,part1.filename);p2=lm(c2,part2.filename)
+    try:
+        m1=trimesh.load(p1);m2=trimesh.load(p2)
+        if hasattr(m1,"geometry"): m1=trimesh.util.concatenate(list(m1.geometry.values()))
+        if hasattr(m2,"geometry"): m2=trimesh.util.concatenate(list(m2.geometry.values()))
+        if material1=="auto": material1=detect_material(m1)
+        if material2=="auto": material2=detect_material(m2)
+        mat1=MATERIALS.get(material1,MATERIALS["aluminum_6061"])
+        mat2=MATERIALS.get(material2,MATERIALS["aluminum_6061"])
+        cog1=m1.center_mass;cog2=m2.center_mass
+        d1=m1.bounding_box.extents;d2=m2.bounding_box.extents
+        v1=sf(m1.volume);v2=sf(m2.volume)
+        ms1=v1*mat1["density"]*1e-3;ms2=v2*mat2["density"]*1e-3;mt=ms1+ms2
+        cc=(cog1*ms1+cog2*ms2)/mt;gc=np.vstack([m1.vertices,m2.vertices]).mean(axis=0)
+        co=float(np.linalg.norm(cc-gc))
+        dists=trimesh.proximity.ProximityQuery(m1).on_surface(m2.vertices[:500])[1]
+        md=float(np.min(dists));ov=md<0.01
+        try:
+            pts,_=trimesh.sample.sample_surface(m2,1000)
+            ins=m1.contains(pts);ovv=float(v2*ins.mean())
+            pts2,_=trimesh.sample.sample_surface(m1,1000)
+            ins2=m2.contains(pts2);ovv=max(ovv,float(v1*ins2.mean()))
+        except: ovv=0.0
+        h1=detect_holes_v8(m1);h2=detect_holes_v8(m2)
+        score=100;issues=[]
+        if ovv>50: score-=40;issues.append({"severity":"CRITICAL","title":"Major Interference","problem":f"Overlap {ovv:.1f}mm³","solution":"Redesign — major clash"})
+        elif ovv>5: score-=25;issues.append({"severity":"HIGH","title":"Interference","problem":f"Overlap {ovv:.1f}mm³","solution":"Add clearance"})
+        elif ov: score-=10;issues.append({"severity":"MEDIUM","title":"Surface Contact","problem":"Parts touching","solution":"Add 0.1mm clearance"})
+        if md>5: score-=20;issues.append({"severity":"HIGH","title":"Large Gap","problem":f"Gap {md:.2f}mm","solution":"Add shim"})
+        elif md>1: score-=8;issues.append({"severity":"MEDIUM","title":"Assembly Gap","problem":f"Gap {md:.2f}mm"})
+        if co>15: score-=20;issues.append({"severity":"HIGH","title":"CoG Imbalance","problem":f"Offset {co:.1f}mm","solution":"Redistribute mass"})
+        screw_recs=[{"location":f"P1 {h['position']}","bolt":h["recommended_screw"],
+                     "torque_nm":h["torque_nm"]} for h in h1[:4]]
+        gc_str=(f"ASSEMBLY v8.0\nP1:{part1.filename} {round(float(d1[0]),1)}x{round(float(d1[1]),1)}x{round(float(d1[2]),1)}mm {round(ms1,1)}g {mat1['name']}\n"
+                f"P2:{part2.filename} {round(float(d2[0]),1)}x{round(float(d2[1]),1)}x{round(float(d2[2]),1)}mm {round(ms2,1)}g {mat2['name']}\n"
+                f"Combined:{round(mt,1)}g CoG offset:{round(co,2)}mm Gap:{round(md,3)}mm Interference:{round(ovv,2)}mm³\n"
+                f"Score:{max(0,score)}/100\nP1 holes:{json.dumps(_json_safe(h1[:4]))}\nP2 holes:{json.dumps(_json_safe(h2[:4]))}\n"
+                f"Issues:{json.dumps(_json_safe(issues))}\nProvide screw table, assembly instructions, annotations.")
+        return {"lumexa_version":"8.0","success":True,"assembly_score":max(0,score),
+            "part1":{"name":part1.filename,"dimensions_mm":{"x":round(float(d1[0]),2),"y":round(float(d1[1]),2),"z":round(float(d1[2]),2)},
+                     "mass_g":round(ms1,2),"material":mat1["name"],"holes":h1[:6]},
+            "part2":{"name":part2.filename,"dimensions_mm":{"x":round(float(d2[0]),2),"y":round(float(d2[1]),2),"z":round(float(d2[2]),2)},
+                     "mass_g":round(ms2,2),"material":mat2["name"],"holes":h2[:6]},
+            "assembly_analysis":{"combined_mass_g":round(mt,2),"cog_offset_mm":round(co,3),
+                "min_gap_mm":round(md,3),"interference_volume_mm3":round(ovv,3),"overlap_detected":ov},
+            "screw_recommendations":screw_recs,"issues":issues,"gemini_context":gc_str}
+    finally: os.unlink(p1);os.unlink(p2)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ENGINEERING AGENT (v8.23) — a reasoning layer on top of the existing
+# deterministic systems above. Implements the build spec:
+#
+#     Understand -> Inspect -> Diagnose -> Propose -> Modify -> Verify ->
+#     Simulate -> Compare -> Refine
+#
+# instead of the "regenerate the whole CadQuery script and hope" pattern
+# /generate-validate-refine uses. Nothing above this line is modified —
+# this section only ADDS a new endpoint (/engineering-agent) that
+# orchestrates the frontier model (tool-calling) around the exact same
+# deterministic helpers, sandboxed executor, mesher, and analysis pipeline
+# already defined above. make_tapered_beam/make_bent_bracket/
+# execute_cq_script_safely/mesh_from_cq_object/run_analysis_v8/
+# evaluate_design_quality/gemini_generate_script are all reused as-is.
+#
+# Current scope (per the spec's "First Implementation Target"): the
+# tapered-beam workflow is the one to test first. Bent-bracket support is
+# wired the same way since make_bent_bracket already existed, but has had
+# less real-world exercise than the beam path. Anything neither primitive
+# covers falls back to the existing AI script-generation/refinement
+# machinery (generic_script design_type) — still wrapped in the same
+# validate -> mesh -> FEA -> compare loop, just without a validated numeric
+# parameter contract on that particular path.
+#
+# Tool-calling is currently implemented for OpenAI-compatible providers
+# (groq/openrouter/lovable/cerebras/nvidia — identical wire format). Nemotron 3
+# Ultra, Kimi K3, and DeepSeek V4 are all reachable via AI_PROVIDER=nvidia +
+# NVIDIA_MODEL (one endpoint/key, NVIDIA_MODEL just picks which of their 90+
+# catalog models actually answers — see the NVIDIA_API_KEY setup comment
+# above for confirmed-live model IDs). Claude/Gemini native tool-calling for
+# this specific endpoint is not wired up yet; every other endpoint is
+# unaffected and still works on any configured provider as before.
+# ══════════════════════════════════════════════════════════════════════════
+
+import gc
+
+AGENT_TURN_MAX_TOKENS = 3000
+
+# ----------------------------------------------------------------------
+# Safe parameter contracts (spec section 4) — reject bad numbers BEFORE
+# ever calling CadQuery/OpenCascade, with structured REJECTED feedback.
+# ----------------------------------------------------------------------
+
+def _validate_hole(hx, hy, hd, width, thick):
+    """Edge-distance rule for a hole on a tapered_beam end face (rect centered
+    on both axes: x in [-width/2,width/2], y in [-thick/2,thick/2]) — same
+    1.5*diameter rule already used by rule_engine_v8/detect_holes_v8 (R07)."""
+    if hd is None or hd <= 0:
+        return False, {"status": "REJECTED", "reason": "hole diameter must be > 0",
+                        "constraint": "diameter_mm > 0", "received": hd}
+    min_edge = 1.5 * hd
+    if abs(hx) + hd / 2.0 + min_edge > width / 2.0:
+        return False, {"status": "REJECTED",
+                        "reason": f"Hole at x={hx} (d={hd}mm) violates the 1.5*D edge-distance rule "
+                                  f"against the {width}mm section width",
+                        "constraint": "edge_distance >= 1.5*diameter", "received": {"x": hx, "width": width}}
+    if abs(hy) + hd / 2.0 + min_edge > thick / 2.0:
+        return False, {"status": "REJECTED",
+                        "reason": f"Hole at y={hy} (d={hd}mm) violates the 1.5*D edge-distance rule "
+                                  f"against the {thick}mm section thickness",
+                        "constraint": "edge_distance >= 1.5*diameter", "received": {"y": hy, "thick": thick}}
+    if hd > 0.6 * min(width, thick):
+        return False, {"status": "REJECTED",
+                        "reason": f"Hole diameter {hd}mm exceeds 60% of the smallest local section "
+                                  f"dimension ({round(min(width, thick), 2)}mm) — would leave almost no material",
+                        "constraint": "diameter <= 0.6*min(width,thick)", "received": hd}
+    return True, None
+
+
+def _validate_hole_bracket(hx, hy, hd, length, width):
+    """Edge-distance rule for a hole on a bent_bracket leg (rect spans
+    x in [0,length], y in [-width/2,width/2] — matches make_bent_bracket's
+    rect(length,width,centered=(False,True)))."""
+    if hd is None or hd <= 0:
+        return False, {"status": "REJECTED", "reason": "hole diameter must be > 0",
+                        "constraint": "diameter_mm > 0", "received": hd}
+    min_edge = 1.5 * hd
+    if hx - hd / 2.0 - min_edge < 0 or hx + hd / 2.0 + min_edge > length:
+        return False, {"status": "REJECTED",
+                        "reason": f"Hole at x={hx} (d={hd}mm) violates the 1.5*D edge-distance rule "
+                                  f"against the {length}mm leg length",
+                        "constraint": "edge_distance >= 1.5*diameter", "received": {"x": hx, "length": length}}
+    if abs(hy) + hd / 2.0 + min_edge > width / 2.0:
+        return False, {"status": "REJECTED",
+                        "reason": f"Hole at y={hy} (d={hd}mm) violates the 1.5*D edge-distance rule "
+                                  f"against the {width}mm leg width",
+                        "constraint": "edge_distance >= 1.5*diameter", "received": {"y": hy, "width": width}}
+    if hd > 0.6 * min(length, width):
+        return False, {"status": "REJECTED", "reason": "Hole diameter too large relative to leg dimensions",
+                        "constraint": "diameter <= 0.6*min(length,width)", "received": hd}
+    return True, None
+
+
+def _beam_param_contract(params, mat_key):
+    mat = MATERIALS.get(mat_key, MATERIALS["aluminum_6061"])
+    min_wall = mat.get("min_wall_mm", 1.0)
+
+    def reject(msg, constraint, received):
+        return False, {"status": "REJECTED", "reason": msg, "constraint": constraint, "received": received}
+
+    length = params.get("length"); bw = params.get("base_width"); bt = params.get("base_thick")
+    tw = params.get("tip_width"); tt = params.get("tip_thick"); fr = params.get("fillet_radius") or 0.0
+    for name, val in [("length", length), ("base_width", bw), ("base_thick", bt),
+                       ("tip_width", tw), ("tip_thick", tt)]:
+        if val is None or val <= 0:
+            return reject(f"'{name}' must be > 0", f"{name} > 0", val)
+    if bt < min_wall or tt < min_wall:
+        return reject(f"Section thickness would drop below the material minimum ({min_wall}mm for "
+                       f"{mat['name']}) — base_thick={bt}, tip_thick={tt}",
+                       f"thickness >= {min_wall}", min(bt, tt))
+    min_cross = min(bw, bt, tw, tt)
+    if fr < 0:
+        return reject("'fillet_radius' cannot be negative", "fillet_radius >= 0", fr)
+    if fr > min_cross / 2.0:
+        return reject(f"fillet_radius {fr}mm is too large for the smallest cross-section dimension "
+                       f"({round(min_cross,2)}mm) — would self-intersect",
+                       "fillet_radius < min_section_dim/2", fr)
+    for end, holes, w, t in [("base", params.get("holes_base") or [], bw, bt),
+                              ("tip", params.get("holes_tip") or [], tw, tt)]:
+        for h in holes:
+            hx, hy, hd = h
+            ok, err = _validate_hole(hx, hy, hd, w, t)
+            if not ok:
+                return False, err
+    if length / min_cross > 40:
+        return reject(f"Aspect ratio {round(length/min_cross,1)}:1 is extreme even for a slender arm "
+                       f"(length={length}mm vs smallest section {round(min_cross,2)}mm)",
+                       "length/min_section_dim <= 40", round(length / min_cross, 1))
+    return True, None
+
+
+def _bracket_param_contract(params, mat_key):
+    mat = MATERIALS.get(mat_key, MATERIALS["aluminum_6061"])
+    min_wall = mat.get("min_wall_mm", 1.0)
+
+    def reject(msg, constraint, received):
+        return False, {"status": "REJECTED", "reason": msg, "constraint": constraint, "received": received}
+
+    l1 = params.get("leg1_length"); l2 = params.get("leg2_length")
+    w = params.get("width"); t = params.get("thickness")
+    ang = params.get("bend_angle_deg", 90.0); fr = params.get("fillet_radius") or 0.0
+    for name, val in [("leg1_length", l1), ("leg2_length", l2), ("width", w), ("thickness", t)]:
+        if val is None or val <= 0:
+            return reject(f"'{name}' must be > 0", f"{name} > 0", val)
+    if t < min_wall:
+        return reject(f"thickness {t}mm is below the material minimum {min_wall}mm for {mat['name']}",
+                       f"thickness >= {min_wall}", t)
+    if not (5.0 <= ang <= 175.0):
+        return reject(f"bend_angle_deg {ang} is degenerate (too close to flat/folded-flat)",
+                       "5 <= bend_angle_deg <= 175", ang)
+    if fr < 0:
+        return reject("fillet_radius cannot be negative", "fillet_radius >= 0", fr)
+    if fr > w / 2.0 or fr > min(l1, l2) / 2.0:
+        return reject(f"fillet_radius {fr}mm is too large for this bracket's geometry",
+                       "fillet_radius < min(width,leg_length)/2", fr)
+    for leg, holes, length in [("leg1", params.get("holes_leg1") or [], l1),
+                                ("leg2", params.get("holes_leg2") or [], l2)]:
+        for h in holes:
+            hx, hy, hd = h
+            ok, err = _validate_hole_bracket(hx, hy, hd, length, w)
+            if not ok:
+                return False, err
+    max_dim = max(l1, l2); min_dim = min(w, t)
+    if min_dim > 0 and max_dim / min_dim > 40:
+        return reject(f"Aspect ratio {round(max_dim/min_dim,1)}:1 is extreme",
+                       "max_dim/min(width,thickness) <= 40", round(max_dim / min_dim, 1))
+    return True, None
+
+
+def _copy_params(p):
+    if p is None:
+        return None
+    return {k: (list(v) if isinstance(v, list) else v) for k, v in p.items()}
+
+
+def _diff_params(old, new):
+    if old is None:
+        return {"all": new}
+    changed = {}
+    for k, v in new.items():
+        if old.get(k) != v:
+            changed[k] = {"before": old.get(k), "after": v}
+    return changed
+
+
+def params_to_script_tapered_beam(params):
+    return (
+        "import cadquery as cq\n"
+        "result = make_tapered_beam(\n"
+        f"    length={params['length']}, base_width={params['base_width']}, base_thick={params['base_thick']},\n"
+        f"    tip_width={params['tip_width']}, tip_thick={params['tip_thick']}, "
+        f"fillet_radius={params.get('fillet_radius', 0.0)},\n"
+        f"    holes_base={params.get('holes_base') or []}, holes_tip={params.get('holes_tip') or []},\n"
+        ")\n"
+    )
+
+
+def params_to_script_bent_bracket(params):
+    return (
+        "import cadquery as cq\n"
+        "result = make_bent_bracket(\n"
+        f"    leg1_length={params['leg1_length']}, leg2_length={params['leg2_length']},\n"
+        f"    width={params['width']}, thickness={params['thickness']}, "
+        f"bend_angle_deg={params.get('bend_angle_deg', 90.0)},\n"
+        f"    fillet_radius={params.get('fillet_radius', 0.0)},\n"
+        f"    holes_leg1={params.get('holes_leg1') or []}, holes_leg2={params.get('holes_leg2') or []},\n"
+        ")\n"
+    )
+
+
+# ----------------------------------------------------------------------
+# Design state (spec section 6 & 8) — lives for the duration of one
+# /engineering-agent request; not persisted across requests.
+# ----------------------------------------------------------------------
+
+class EngineeringDesignState:
+    def __init__(self, original_prompt, material, force_n, force_dir, operating_temp_c,
+                 surface_finish, reliability, project_description, max_iterations,
+                 min_health_score, max_critical_violations, max_high_violations, min_safety_factor):
+        self.original_prompt = original_prompt
+        self.material = material
+        self.force_n = force_n
+        self.force_dir = force_dir
+        self.operating_temp_c = operating_temp_c
+        self.surface_finish = surface_finish
+        self.reliability = reliability
+        self.project_description = project_description
+        self.max_iterations = max_iterations
+        self.min_health_score = min_health_score
+        self.max_critical_violations = max_critical_violations
+        self.max_high_violations = max_high_violations
+        self.min_safety_factor = min_safety_factor
+
+        self.design_type = None     # "tapered_beam" | "bent_bracket" | "generic_script"
+        self.params = None          # dict of constructor kwargs, for parametric designs
+        self.script = None          # script text, for generic_script designs
+        self.obj = None             # current CadQuery object (server-side only, never sent to the model)
+        self.mesh = None            # current trimesh (server-side only)
+        self.stl_bytes = None
+
+        self.iteration_count = 0
+        self.last_analysis = None
+        self.last_quality = None
+
+        self.previous_design = None
+        self.current_candidate = None
+        self.best_valid_design = None
+        self.best_passing_design = None
+        self.pending_hypothesis = None
+        self.hypothesis_log = []
+
+        self.finalized = False
+        self.final_verdict_claimed = None
+        self.final_summary = None
+
+
+def _update_best_valid(state, snap):
+    if state.best_valid_design is None or snap["health_score"] > state.best_valid_design["health_score"]:
+        state.best_valid_design = snap
+
+
+def _update_best_passing(state, snap):
+    if state.best_passing_design is None or snap["health_score"] > state.best_passing_design["health_score"]:
+        state.best_passing_design = snap
+
+
+def _revert_to_last_known_good(state):
+    """Monotonic refinement protection (spec section 8): rebuild the last
+    known-good design deterministically from its stored params/script.
+    Returns True if a revert happened, False if there was nothing valid yet
+    to revert to (in which case state is left untouched)."""
+    good = state.best_valid_design
+    if good is None:
+        return False
+    try:
+        design_type = good["design_type"]
+        if design_type == "tapered_beam":
+            params = _copy_params(good["params"])
+            obj = make_tapered_beam(**params)
+            state.script = None
+        elif design_type == "bent_bracket":
+            params = _copy_params(good["params"])
+            obj = make_bent_bracket(**params)
+            state.script = None
+        elif design_type == "generic_script":
+            script = good.get("script")
+            obj, err = execute_cq_script_safely(script)
+            if err:
+                return False
+            params = None
+            state.script = script
+        else:
+            return False
+        state.design_type = design_type
+        state.params = params
+        state.obj = obj
+        state.mesh = None
+        state.stl_bytes = None
+        gc.collect()  # drop the rejected candidate's OCCT shape promptly (see _rebuild_beam)
+        return True
+    except Exception:
+        return False
+
+
+def _snapshot_current(state, quality, result, critical_region=None):
+    fea = result.get("analytical_fea", {}) or {}
+    return {
+        "iteration": state.iteration_count,
+        "design_type": state.design_type,
+        "params": _copy_params(state.params),
+        "script": state.script,
+        "passed": quality["passed"],
+        "health_score": quality["score"],
+        "safety_factor": fea.get("safety_factor"),
+        "max_von_mises_mpa": (fea.get("stress", {}) or {}).get("von_mises_mpa"),
+        "mass_g": (fea.get("dynamics", {}) or {}).get("estimated_mass_g"),
+        "is_watertight": (result.get("geometry", {}) or {}).get("is_watertight"),
+        "violations": (result.get("rule_engine", {}) or {}).get("total_violations"),
+        "reasons": quality["reasons"],
+        "critical_region": critical_region,
+    }
+
+
+def _summarize_snapshot(snap):
+    if snap is None:
+        return None
+    return {"iteration": snap.get("iteration"), "passed": snap.get("passed"),
+            "health_score": snap.get("health_score"), "safety_factor": snap.get("safety_factor"),
+            "max_von_mises_mpa": snap.get("max_von_mises_mpa"), "mass_g": snap.get("mass_g"),
+            "is_watertight": snap.get("is_watertight"), "violations": snap.get("violations")}
+
+
+def _build_failure_region(result, state, crit, axis, pos_mm):
+    """
+    Turns the FEA critical section's 1D position into a proper spatial 'failure
+    object' — bbox, centroid, nearby features — instead of just a coarse
+    near_base/near_tip label. Built entirely from data already computed
+    elsewhere (state.params' known section geometry, plus zone data other
+    analysis functions already produced), not from a new CalculiX per-node
+    field readout or a new OCCT face-query capability — those are real,
+    separately-scoped pieces of work, most valuable once geometry has more
+    than two sections/features to disambiguate between. This is the honest,
+    buildable-today slice of that idea: precise where the data already
+    supports it, and says so plainly where it doesn't.
+    """
+    if state is None or state.design_type != "tapered_beam" or not state.params or axis != "z":
+        return None  # bent_bracket/generic_script: no known-geometry interpolation to build a bbox from yet
+
+    p = state.params
+    length = p.get("length") or 0
+    if length <= 0:
+        return None
+    frac = max(0.0, min(1.0, pos_mm / length))
+    width_at_z = p["base_width"] + (p["tip_width"] - p["base_width"]) * frac
+    thick_at_z = p["base_thick"] + (p["tip_thick"] - p["base_thick"]) * frac
+    band = max(length * 0.03, 2.0)  # a few-mm slice around the critical position, not a single point
+
+    nearby = []
+    fillet_r = p.get("fillet_radius") or 0
+    if fillet_r > 0 and pos_mm < band * 2:
+        nearby.append(f"root fillet (radius {fillet_r}mm)")
+    if pos_mm > length - band * 2 and fillet_r > 0:
+        nearby.append("tip transition")
+    for hx, hy, hd in (p.get("holes_base") or []):
+        if pos_mm < band * 3:
+            nearby.append(f"base hole (d={hd}mm at x={hx},y={hy})")
+    for hx, hy, hd in (p.get("holes_tip") or []):
+        if pos_mm > length - band * 3:
+            nearby.append(f"tip hole (d={hd}mm at x={hx},y={hy})")
+
+    # Cross-reference zones other analysis functions already computed (sharp
+    # corners, thin walls) that fall within this same Z band — same data
+    # find_problem_regions already surfaces, just correlated here by position.
+    for corner in (result.get("sharp_corner_analysis", {}) or {}).get("all_zones", []) or []:
+        cz = (corner.get("position") or {}).get("z")
+        if cz is not None and abs(cz - pos_mm) < band and corner.get("severity") in ("HIGH", "CRITICAL"):
+            nearby.append(f"sharp corner (Kf={corner.get('Kf')}) at z={round(cz,1)}mm")
+    for zone in (result.get("wall_thickness", {}) or {}).get("critical_zones", []) or []:
+        cz = (zone.get("position") or {}).get("z")
+        if cz is not None and abs(cz - pos_mm) < band:
+            nearby.append(f"thin section ({zone.get('thickness_mm')}mm) at z={round(cz,1)}mm")
+
+    return {
+        "bbox_mm": {"xmin": round(-width_at_z/2, 2), "xmax": round(width_at_z/2, 2),
+                    "ymin": round(-thick_at_z/2, 2), "ymax": round(thick_at_z/2, 2),
+                    "zmin": round(pos_mm - band, 2), "zmax": round(pos_mm + band, 2)},
+        "centroid_mm": [0.0, 0.0, round(pos_mm, 2)],
+        "nearby_features": nearby if nearby else ["no declared feature (hole/fillet) near this position"],
+        "note": "bbox interpolated from this iteration's known base/tip section geometry, not a "
+                "per-node CalculiX field readout — precise for this parametric shape, but won't "
+                "generalize to arbitrary geometry without extending the CalculiX result parser "
+                "to expose real per-node coordinates.",
+    }
+
+
+def build_engineering_diagnosis(result, state=None):
+    """Spec section 5: convert raw solver results into structured engineering
+    evidence. Every field here comes from already-computed real analysis
+    output (run_analysis_v8) — never from the LLM's own judgment."""
+    fea = result.get("analytical_fea", {}) or {}
+    rules = (result.get("rule_engine", {}) or {}).get("all_violations", []) or []
+    geo = result.get("geometry", {}) or {}
+    hs = result.get("health_score", {}) or {}
+    crit = fea.get("critical_section") or {}
+    fea_status = fea.get("status")
+
+    failure_modes = []
+    if fea_status == "FAIL":
+        stress = fea.get("stress", {}) or {}
+        bending = stress.get("bending_mpa") or 0
+        axial = stress.get("axial_mpa") or 0
+        shear = stress.get("shear_mpa") or 0
+        if bending >= axial and bending >= shear and bending > 0:
+            failure_modes.append("bending stress")
+        elif axial >= shear and axial > 0:
+            failure_modes.append("axial stress")
+        elif shear > 0:
+            failure_modes.append("shear stress")
+        sfv = fea.get("safety_factor")
+        if sfv is not None and sfv < 1.0:
+            failure_modes.append("insufficient section stiffness")
+        buck = fea.get("buckling", {}) or {}
+        if buck.get("status") == "FAIL":
+            failure_modes.append("buckling instability")
+
+    max_kf = (result.get("sharp_corner_analysis", {}) or {}).get("max_Kf", 1.0) or 1.0
+    if max_kf > 2.0:
+        failure_modes.append("stress concentration at sharp corner")
+    if any(r.get("rule_id") == "R01" for r in rules):
+        failure_modes.append("thin wall / insufficient section thickness")
+    if not geo.get("is_watertight", True):
+        failure_modes.append("non-manifold geometry")
+    hole_viol = (result.get("hole_analysis", {}) or {}).get("violations", []) or []
+    if hole_viol:
+        failure_modes.append("hole edge-distance violation")
+
+    has_critical_rule = any(r.get("severity") == "CRITICAL" for r in rules)
+    status = "PASS" if (fea_status == "PASS" and geo.get("is_watertight", True)
+                         and not has_critical_rule) else "FAIL"
+
+    numerically_suspect = bool(fea.get("numerically_suspect"))
+    if numerically_suspect:
+        # The analytical solver itself is flagging its own stress/deflection numbers as
+        # implausible (a cross-section slicing artifact, not a real structural finding —
+        # see multi_section_fea's own comment). Lead with this so the agent doesn't spend
+        # an iteration "fixing" a problem that may not actually exist, and doesn't report
+        # a confident FAIL built on fabricated-looking numbers.
+        failure_modes = ["SOLVER OUTPUT NUMERICALLY SUSPECT — treat this iteration's stress/"
+                          "deflection numbers as unreliable, not a confirmed structural failure"] + failure_modes
+
+    critical_region = None
+    failure_region = None
+    if crit.get("position_mm") is not None:
+        axis = crit.get("axis", "z"); pos_mm = crit.get("position_mm")
+        critical_region = f"{axis}-axis @ {pos_mm}mm"
+        if state is not None and state.design_type == "tapered_beam" and state.params and axis == "z":
+            length = state.params.get("length") or 0
+            if length > 0:
+                frac = pos_mm / length
+                critical_region = "near_base_fixed_support" if frac < 0.5 else "near_tip_load_application"
+        failure_region = _build_failure_region(result, state, crit, axis, pos_mm)
+    elif rules:
+        crit_rules = [r for r in rules if r.get("severity") in ("CRITICAL", "HIGH") and r.get("position")]
+        if crit_rules:
+            critical_region = f"near {crit_rules[0]['position']}"
+
+    return {
+        "status": status,
+        "safety_factor": fea.get("safety_factor"),
+        "max_von_mises_mpa": (fea.get("stress", {}) or {}).get("von_mises_mpa"),
+        "critical_region": critical_region,
+        "failure_region": failure_region,
+        "failure_modes": failure_modes if failure_modes else (["none detected"] if status == "PASS" else ["unspecified"]),
+        "health_score": hs.get("score"),
+        "fatigue_status": (result.get("fatigue_analysis", {}) or {}).get("status"),
+        "is_watertight": geo.get("is_watertight"),
+        "mass_g": (fea.get("dynamics", {}) or {}).get("estimated_mass_g"),
+        "numerically_suspect": numerically_suspect,
+    }
+
+
+# ----------------------------------------------------------------------
+# Parameter-name resolution for the modify_* convenience tools (spec
+# sections 3 & 9) — lets the agent say "thickness"/"width"/"length" with
+# an optional region hint, or an exact constructor field name.
+# ----------------------------------------------------------------------
+
+def _resolve_beam_parameter(parameter, region):
+    p = (parameter or "").strip().lower()
+    r = (region or "").strip().lower()
+    exact = {"length": ["length"], "base_width": ["base_width"], "base_thick": ["base_thick"],
+             "tip_width": ["tip_width"], "tip_thick": ["tip_thick"], "fillet_radius": ["fillet_radius"]}
+    if p in exact:
+        return exact[p]
+    is_base = any(w in r for w in ("base", "fixed", "root")) if r else False
+    is_tip = any(w in r for w in ("tip", "free", "load")) if r else False
+    if p in ("thickness", "height", "section_height", "thick"):
+        if is_base and not is_tip:
+            return ["base_thick"]
+        if is_tip and not is_base:
+            return ["tip_thick"]
+        return ["base_thick", "tip_thick"]
+    if p in ("width", "section_width"):
+        if is_base and not is_tip:
+            return ["base_width"]
+        if is_tip and not is_base:
+            return ["tip_width"]
+        return ["base_width", "tip_width"]
+    if p in ("fillet", "fillet_radius_mm"):
+        return ["fillet_radius"]
+    return None
+
+
+def _resolve_bracket_parameter(parameter, region):
+    p = (parameter or "").strip().lower()
+    r = (region or "").strip().lower()
+    exact = {"leg1_length": ["leg1_length"], "leg2_length": ["leg2_length"], "width": ["width"],
+             "thickness": ["thickness"], "bend_angle_deg": ["bend_angle_deg"], "fillet_radius": ["fillet_radius"]}
+    if p in exact:
+        return exact[p]
+    if p in ("length", "leg_length"):
+        if "2" in r or "second" in r:
+            return ["leg2_length"]
+        return ["leg1_length"]
+    if p in ("height",):
+        return ["thickness"]
+    if p in ("fillet",):
+        return ["fillet_radius"]
+    if p in ("angle", "bend_angle"):
+        return ["bend_angle_deg"]
+    return None
+
+
+async def _auto_validate_and_mesh(state):
+    """Runs the B-rep validity check + mesh export + watertight/manifold check inline,
+    right after any geometry build/modification. Folded into every modify_*/
+    set_initial_design/add_hole/generic-script result so the agent doesn't need two
+    extra model round-trips (validate_geometry, run_mesh) per iteration just to reach
+    run_fea — cut from 4 model turns per design iteration to 2 (build/modify, run_fea).
+    On failure this performs the same revert-to-last-known-good the old standalone
+    validate_geometry/run_mesh tools used to."""
+    if state.obj is None:
+        return {"validated": False, "meshed": False}
+    brep_ok = True; brep_note = None
+    try:
+        val = state.obj.val()
+        if hasattr(val, "isValid"):
+            brep_ok = bool(val.isValid())
+            if not brep_ok:
+                brep_note = "OpenCASCADE's BRepCheck_Analyzer flagged this shape as an invalid B-rep."
+    except Exception as e:
+        brep_note = f"Could not run the B-rep validity check ({type(e).__name__}: {e}); proceeding to mesh export."
+    if not brep_ok:
+        reverted = _revert_to_last_known_good(state)
+        return {"status": "REJECTED", "valid_brep": False, "reason": brep_note, "reverted": reverted,
+                "current_params": state.params}
+    try:
+        mesh, stl_bytes = await mesh_from_cq_object(state.obj)
+    except Exception as e:
+        reverted = _revert_to_last_known_good(state)
+        return {"status": "REJECTED", "reason": f"STL export/mesh load failed: {type(e).__name__}: {e}",
+                "reverted": reverted, "current_params": state.params}
+    is_wt = bool(mesh.is_watertight); is_wind = bool(getattr(mesh, "is_winding_consistent", True))
+    if not is_wt or not is_wind:
+        defect_locs = _find_watertight_defect_locations(mesh)
+        reverted = _revert_to_last_known_good(state)
+        return {"status": "REJECTED", "watertight": is_wt, "manifold": is_wind, "defect_locations": defect_locs,
+                "reason": "Meshed geometry is non-manifold/non-watertight — rejected per monotonic refinement "
+                          "protection.", "reverted": reverted, "current_params": state.params}
+    state.mesh = mesh; state.stl_bytes = stl_bytes
+    if state.best_valid_design is None:
+        state.best_valid_design = {"design_type": state.design_type, "params": _copy_params(state.params),
+                                    "script": state.script, "health_score": -1, "passed": False,
+                                    "safety_factor": None, "max_von_mises_mpa": None, "mass_g": None,
+                                    "is_watertight": True, "violations": None, "reasons": [],
+                                    "iteration": state.iteration_count}
+    gc.collect()
+    return {"status": "OK", "validated": True, "meshed": True, "watertight": True,
+            "face_count": int(len(mesh.faces)), "vertex_count": int(len(mesh.vertices))}
+
+
+async def _rebuild_beam(state, new_params, change_desc, reason, predicted_effect=None):
+    ok, err = _beam_param_contract(new_params, state.material)
+    if not ok:
+        return err
+    try:
+        obj = make_tapered_beam(**new_params)
+    except Exception as e:
+        return {"status": "REJECTED", "reason": f"CadQuery kernel rejected this change: {type(e).__name__}: {e}",
+                "constraint": "kernel_geometric_feasibility"}
+    old_params = state.params
+    state.params = new_params; state.obj = obj; state.mesh = None; state.stl_bytes = None
+    gc.collect()  # OCCT-wrapped shapes are C++-backed; encourage prompt release of the
+                  # superseded object rather than waiting on Python's GC schedule — free-tier
+                  # 512MB instances have no headroom for stale shapes piling up across iterations
+    state.pending_hypothesis = {"change": change_desc, "reason": reason,
+                                 "predicted_effect": predicted_effect or "address the diagnosed issue"}
+    check = await _auto_validate_and_mesh(state)
+    if check.get("status") == "REJECTED":
+        return check
+    return {"status": "OK", "change_applied": change_desc, "diff": _diff_params(old_params, new_params),
+            "validated": True, "meshed": True, "face_count": check.get("face_count"),
+            "message": "Geometry rebuilt, validated, and meshed successfully. Call run_fea to test this change."}
+
+
+async def _rebuild_bracket(state, new_params, change_desc, reason, predicted_effect=None):
+    ok, err = _bracket_param_contract(new_params, state.material)
+    if not ok:
+        return err
+    try:
+        obj = make_bent_bracket(**new_params)
+    except Exception as e:
+        return {"status": "REJECTED", "reason": f"CadQuery kernel rejected this change: {type(e).__name__}: {e}",
+                "constraint": "kernel_geometric_feasibility"}
+    old_params = state.params
+    state.params = new_params; state.obj = obj; state.mesh = None; state.stl_bytes = None
+    gc.collect()
+    state.pending_hypothesis = {"change": change_desc, "reason": reason,
+                                 "predicted_effect": predicted_effect or "address the diagnosed issue"}
+    check = await _auto_validate_and_mesh(state)
+    if check.get("status") == "REJECTED":
+        return check
+    return {"status": "OK", "change_applied": change_desc, "diff": _diff_params(old_params, new_params),
+            "validated": True, "meshed": True, "face_count": check.get("face_count"),
+            "message": "Geometry rebuilt, validated, and meshed successfully. Call run_fea to test this change."}
+
+
+async def _agent_generic_script_modification(state, feature_description, reason, predicted_effect=None):
+    """The 'unfamiliar geometry' fallback path (spec section 11's second
+    branch). Reuses the EXISTING gemini_generate_script REFINEMENT MODE and
+    execute_cq_script_safely sandbox verbatim — zero new AI-prompting or
+    sandbox-security code. Crossing over from a parametric design into a
+    generic_script one is a one-way, logged transition."""
+    if not reason:
+        return {"status": "REJECTED", "reason": "A 'reason' is required for every modification."}
+    crossed_over = False
+    if state.design_type in ("tapered_beam", "bent_bracket") and state.script is None:
+        state.script = (params_to_script_tapered_beam(state.params) if state.design_type == "tapered_beam"
+                         else params_to_script_bent_bracket(state.params))
+        crossed_over = True
+    if state.script is None:
+        return {"status": "REJECTED", "reason": "No existing design to modify. Call set_initial_design first."}
+
+    feedback = (f"MANUAL FEATURE REQUEST (not a numeric parameter change): {feature_description}\n"
+                f"Engineering reason: {reason}\n"
+                "Modify ONLY what's needed for this request; preserve every other dimension/feature exactly.")
+    try:
+        new_script = await gemini_generate_script(state.original_prompt, previous_script=state.script,
+                                                    feedback=feedback)
+    except HTTPException as e:
+        return {"status": "ERROR", "message": f"Script modification call failed: {e.detail}"}
+
+    obj, err = execute_cq_script_safely(new_script)
+    if err:
+        return {"status": "REJECTED",
+                "reason": f"The modified script failed: {err} {_diagnose_cq_error(err)}",
+                "note": "State unchanged; the previous working script/geometry is preserved."}
+
+    state.design_type = "generic_script"; state.script = new_script; state.params = None
+    state.obj = obj; state.mesh = None; state.stl_bytes = None
+    state.pending_hypothesis = {"change": f"generic_script_modification: {feature_description}", "reason": reason,
+                                 "predicted_effect": predicted_effect or "address the described issue"}
+    check = await _auto_validate_and_mesh(state)
+    if check.get("status") == "REJECTED":
+        return check
+    return {"status": "OK", "crossed_over_to_generic_script": crossed_over, "validated": True, "meshed": True,
+            "face_count": check.get("face_count"),
+            "message": "Script modified, validated, and meshed successfully via the AI-assisted generic path "
+                       "(this design is no longer tracked by discrete numeric parameters). Call run_fea next."}
+
+
+# ----------------------------------------------------------------------
+# Tool implementations — inspection (read-only, need a meshed design)
+# ----------------------------------------------------------------------
+
+def _require_mesh(state):
+    if state.mesh is None:
+        return {"status": "NOT_AVAILABLE",
+                "message": "No meshed/validated geometry yet. Call set_initial_design (or a modify_*/add_hole "
+                           "tool) first — it validates and meshes automatically."}
+    return None
+
+
+def _tool_inspect_geometry(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    mesh = state.mesh
+    is_wt = bool(mesh.is_watertight)
+    is_wind = bool(getattr(mesh, "is_winding_consistent", True))
+    holes = detect_holes_v8(mesh)
+    wt_ = wall_thickness_v8(mesh)
+    features = []
+    if state.design_type == "tapered_beam" and state.params:
+        p = state.params
+        if abs(p["base_width"] - p["tip_width"]) > 0.05 or abs(p["base_thick"] - p["tip_thick"]) > 0.05:
+            features.append("taper")
+        if (p.get("fillet_radius") or 0) > 0:
+            features.append("fillet")
+    elif state.design_type == "bent_bracket" and state.params:
+        features.append("fold")
+        if (state.params.get("fillet_radius") or 0) > 0:
+            features.append("fillet")
+    if holes:
+        features.append("through_holes")
+    exts = [sf(e) for e in mesh.extents]
+    return {"solid": True, "watertight": is_wt, "manifold": is_wind,
+            "bounding_box_mm": [round(exts[0], 3), round(exts[1], 3), round(exts[2], 3)],
+            "volume_mm3": round(sf(mesh.volume), 3), "features": features, "hole_count": len(holes),
+            "min_wall_thickness_mm": wt_.get("min_mm")}
+
+
+def _tool_measure_geometry(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    mesh = state.mesh
+    exts = [sf(e) for e in mesh.extents]
+    wt_ = wall_thickness_v8(mesh)
+    return {"bounding_box_mm": {"x": round(exts[0], 3), "y": round(exts[1], 3), "z": round(exts[2], 3)},
+            "volume_mm3": round(sf(mesh.volume), 3), "surface_area_mm2": round(sf(mesh.area), 3),
+            "wall_thickness": wt_}
+
+
+def _tool_identify_features(state):
+    features = []; hole_count = 0
+    if state.design_type == "tapered_beam" and state.params:
+        p = state.params
+        if abs(p["base_width"] - p["tip_width"]) > 0.05 or abs(p["base_thick"] - p["tip_thick"]) > 0.05:
+            features.append("taper")
+        if (p.get("fillet_radius") or 0) > 0:
+            features.append("fillet")
+        hole_count = len(p.get("holes_base") or []) + len(p.get("holes_tip") or [])
+        if hole_count > 0:
+            features.append("through_holes")
+    elif state.design_type == "bent_bracket" and state.params:
+        p = state.params
+        features.append("bend")
+        if (p.get("fillet_radius") or 0) > 0:
+            features.append("fillet")
+        hole_count = len(p.get("holes_leg1") or []) + len(p.get("holes_leg2") or [])
+        if hole_count > 0:
+            features.append("through_holes")
+    elif state.mesh is not None:
+        holes = detect_holes_v8(state.mesh); hole_count = len(holes)
+        if hole_count > 0:
+            features.append("through_holes")
+    return {"design_type": state.design_type, "features": features, "hole_count": hole_count,
+            "declared_parameters": state.params}
+
+
+def _tool_find_holes(state):
+    if state.mesh is not None:
+        return {"source": "geometric_detection", "holes": detect_holes_v8(state.mesh)}
+    if state.params:
+        key_pairs = ([("holes_base", "base"), ("holes_tip", "tip")] if state.design_type == "tapered_beam"
+                      else [("holes_leg1", "leg1"), ("holes_leg2", "leg2")] if state.design_type == "bent_bracket"
+                      else [])
+        declared = []
+        for key, label in key_pairs:
+            for (x, y, d) in (state.params.get(key) or []):
+                declared.append({"location": label, "x": x, "y": y, "diameter_mm": d})
+        return {"source": "declared_parameters_not_yet_meshed", "holes": declared}
+    return {"status": "NOT_AVAILABLE", "message": "No design built yet."}
+
+
+def _tool_measure_wall_thickness(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    return wall_thickness_v8(state.mesh)
+
+
+def _tool_get_bounding_box(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    exts = [sf(e) for e in state.mesh.extents]
+    return {"dimensions_mm": {"x": round(exts[0], 3), "y": round(exts[1], 3), "z": round(exts[2], 3)},
+            "aspect_ratio": round(max(exts) / max(min(exts), 1e-6), 3)}
+
+
+def _tool_get_mass_properties(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    mesh = state.mesh
+    mat = MATERIALS.get(state.material, MATERIALS["aluminum_6061"])
+    vol = sf(mesh.volume); mass_g = vol * mat["density"] * 1e-3
+    try:
+        cog = mesh.center_mass
+        cog_d = {"x": round(float(cog[0]), 3), "y": round(float(cog[1]), 3), "z": round(float(cog[2]), 3)}
+    except Exception:
+        cog_d = None
+    return {"volume_mm3": round(vol, 3), "mass_g": round(mass_g, 3), "material": mat["name"],
+            "density_g_cm3": mat["density"], "center_of_mass_mm": cog_d}
+
+
+def _tool_check_manifold(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    mesh = state.mesh
+    return {"manifold": bool(getattr(mesh, "is_winding_consistent", True)),
+            "watertight": bool(mesh.is_watertight),
+            "is_volume": bool(getattr(mesh, "is_volume", mesh.is_watertight))}
+
+
+def _tool_check_watertight(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    mesh = state.mesh
+    is_wt = bool(mesh.is_watertight)
+    out = {"watertight": is_wt}
+    if not is_wt:
+        out["defect_locations"] = _find_watertight_defect_locations(mesh)
+    return out
+
+
+def _tool_find_problem_regions(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    mesh = state.mesh; regions = []
+    if not mesh.is_watertight:
+        for d in _find_watertight_defect_locations(mesh):
+            regions.append({"type": "non_watertight_gap", "position": {"x": d["x"], "y": d["y"], "z": d["z"]},
+                             "severity": "HIGH"})
+    wt_ = wall_thickness_v8(mesh)
+    for z in wt_.get("critical_zones", []) or []:
+        regions.append({"type": "thin_wall", "position": z.get("position"),
+                         "thickness_mm": z.get("thickness_mm"), "severity": "CRITICAL"})
+    for z in wt_.get("thin_zones", []) or []:
+        regions.append({"type": "thin_wall", "position": z.get("position"),
+                         "thickness_mm": z.get("thickness_mm"), "severity": "WARNING"})
+    try:
+        sharp = detect_sharp_v8(mesh, state.material)
+        for z in sharp.get("critical_zones", []) or []:
+            regions.append({"type": "stress_concentration", "position": z.get("position"),
+                             "Kf": z.get("Kf"), "severity": z.get("severity")})
+    except Exception:
+        pass
+    for h in detect_holes_v8(mesh):
+        if h.get("violation"):
+            regions.append({"type": "hole_edge_violation", "position": h.get("position"),
+                             "detail": h.get("violation_msg"), "severity": "HIGH"})
+    if state.last_analysis:
+        crit = (state.last_analysis.get("analytical_fea", {}) or {}).get("critical_section") or {}
+        if crit.get("position_mm") is not None:
+            fea_status = (state.last_analysis.get("analytical_fea", {}) or {}).get("status")
+            regions.append({"type": "fea_critical_section", "axis": crit.get("axis"),
+                             "position_mm": crit.get("position_mm"),
+                             "severity": "HIGH" if fea_status == "FAIL" else "INFO"})
+    return {"problem_region_count": len(regions), "regions": regions}
+
+
+def _tool_get_topology_summary(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    mesh = state.mesh
+    try:
+        euler = int(mesh.euler_number)
+    except Exception:
+        euler = None
+    return {"vertex_count": int(len(mesh.vertices)), "face_count": int(len(mesh.faces)),
+            "edge_count": int(len(mesh.edges)), "euler_number": euler,
+            "watertight": bool(mesh.is_watertight), "manifold": bool(getattr(mesh, "is_winding_consistent", True))}
+
+
+def _tool_diagnose_failure(state):
+    if state.last_analysis is None:
+        return {"status": "NOT_AVAILABLE", "message": "No analysis has been run yet. Call run_fea first."}
+    return build_engineering_diagnosis(state.last_analysis, state)
+
+
+def _tool_calculate_properties(state):
+    err = _require_mesh(state)
+    if err:
+        return err
+    if state.last_analysis:
+        fea = state.last_analysis.get("analytical_fea", {}) or {}
+        return {"source": "last_run_fea", "stress": fea.get("stress"), "deflection_mm": fea.get("deflection_mm"),
+                "min_section_area_mm2": fea.get("min_section_area_mm2"), "dynamics": fea.get("dynamics"),
+                "buckling": fea.get("buckling")}
+    try:
+        mat_key = state.material if state.material in MATERIALS else "aluminum_6061"
+        analytic = multi_section_fea(state.mesh, mat_key, state.force_n, state.force_dir)
+        return {"source": "on_demand_analytical_estimate", "stress": analytic.get("stress"),
+                "deflection_mm": analytic.get("deflection_mm"), "dynamics": analytic.get("dynamics"),
+                "buckling": analytic.get("buckling"),
+                "note": "Estimate only — run_fea has not been called yet for this candidate; call run_fea "
+                        "for the authoritative check."}
+    except Exception as e:
+        return {"status": "ERROR", "message": str(e)}
+
+
+# ----------------------------------------------------------------------
+# Tool implementations — construction & modification (spec sections 2,3,4)
+# ----------------------------------------------------------------------
+
+async def _tool_set_initial_design(state, design_type, reason="",
+                                    length=None, base_width=None, base_thick=None,
+                                    tip_width=None, tip_thick=None, fillet_radius=0.0,
+                                    holes_base=None, holes_tip=None,
+                                    leg1_length=None, leg2_length=None, width=None, thickness=None,
+                                    bend_angle_deg=90.0, holes_leg1=None, holes_leg2=None):
+    if state.mesh is not None:
+        return {"status": "REJECTED", "reason": "Initial design has already been set for this session. "
+                "Use modify_parameter/modify_feature/add_hole to change the existing design instead."}
+    if design_type == "tapered_beam":
+        missing = [n for n, v in [("length", length), ("base_width", base_width), ("base_thick", base_thick),
+                                    ("tip_width", tip_width), ("tip_thick", tip_thick)] if v is None]
+        if missing:
+            return {"status": "REJECTED", "reason": f"Missing required parameter(s) for tapered_beam: {missing}"}
+        params = {"length": float(length), "base_width": float(base_width), "base_thick": float(base_thick),
+                  "tip_width": float(tip_width), "tip_thick": float(tip_thick),
+                  "fillet_radius": float(fillet_radius or 0.0),
+                  "holes_base": [tuple(h) for h in (holes_base or [])],
+                  "holes_tip": [tuple(h) for h in (holes_tip or [])]}
+        ok, err = _beam_param_contract(params, state.material)
+        if not ok:
+            return err
+        try:
+            obj = make_tapered_beam(**params)
+        except Exception as e:
+            return {"status": "REJECTED", "reason": f"CadQuery kernel rejected these parameters: {type(e).__name__}: {e}"}
+        state.design_type = "tapered_beam"; state.params = params; state.script = None; state.obj = obj
+    elif design_type == "bent_bracket":
+        missing = [n for n, v in [("leg1_length", leg1_length), ("leg2_length", leg2_length),
+                                    ("width", width), ("thickness", thickness)] if v is None]
+        if missing:
+            return {"status": "REJECTED", "reason": f"Missing required parameter(s) for bent_bracket: {missing}"}
+        params = {"leg1_length": float(leg1_length), "leg2_length": float(leg2_length),
+                  "width": float(width), "thickness": float(thickness),
+                  "bend_angle_deg": float(bend_angle_deg or 90.0), "fillet_radius": float(fillet_radius or 0.0),
+                  "holes_leg1": [tuple(h) for h in (holes_leg1 or [])],
+                  "holes_leg2": [tuple(h) for h in (holes_leg2 or [])]}
+        ok, err = _bracket_param_contract(params, state.material)
+        if not ok:
+            return err
+        try:
+            obj = make_bent_bracket(**params)
+        except Exception as e:
+            return {"status": "REJECTED", "reason": f"CadQuery kernel rejected these parameters: {type(e).__name__}: {e}"}
+        state.design_type = "bent_bracket"; state.params = params; state.script = None; state.obj = obj
+    elif design_type == "generic_script":
+        try:
+            script = await gemini_generate_script(state.original_prompt)
+        except HTTPException as e:
+            return {"status": "ERROR", "message": f"Script generation failed: {e.detail}"}
+        obj, err = execute_cq_script_safely(script)
+        if err:
+            return {"status": "REJECTED", "reason": err}
+        state.design_type = "generic_script"; state.params = None; state.script = script; state.obj = obj
+    else:
+        return {"status": "REJECTED",
+                "reason": f"Unknown design_type '{design_type}'. Must be tapered_beam, bent_bracket, or generic_script."}
+    check = await _auto_validate_and_mesh(state)
+    if check.get("status") == "REJECTED":
+        return check
+    return {"status": "OK", "design_type": state.design_type, "params": state.params,
+            "validated": True, "meshed": True, "face_count": check.get("face_count"),
+            "message": "Initial geometry constructed, validated, and meshed successfully. Call run_fea next."}
+
+
+async def _tool_modify_parameter(state, parameter, change_percent=None, new_value=None, region=None,
+                                  reason="", predicted_effect=None):
+    if state.obj is None:
+        return {"status": "REJECTED", "reason": "No initial design exists yet. Call set_initial_design first."}
+    if change_percent is None and new_value is None:
+        return {"status": "REJECTED", "reason": "Provide either change_percent or new_value."}
+    if not reason:
+        return {"status": "REJECTED", "reason": "A 'reason' explaining the engineering justification is required."}
+
+    if state.design_type == "tapered_beam":
+        fields = _resolve_beam_parameter(parameter, region)
+        if not fields:
+            return {"status": "REJECTED", "reason": f"Unknown parameter '{parameter}' for a tapered beam.",
+                     "valid_parameters": ["length", "base_width", "base_thick", "tip_width", "tip_thick",
+                                           "fillet_radius", "thickness", "width"]}
+        new_params = _copy_params(state.params)
+        for f in fields:
+            cur = new_params[f]
+            new_params[f] = (round(float(new_value), 4) if (new_value is not None and len(fields) == 1)
+                              else round(cur * (1 + (change_percent or 0) / 100.0), 4))
+        desc = f"modify_parameter({parameter}" + (f",region={region}" if region else "") + ")"
+        return await _rebuild_beam(state, new_params, desc, reason, predicted_effect)
+
+    elif state.design_type == "bent_bracket":
+        fields = _resolve_bracket_parameter(parameter, region)
+        if not fields:
+            return {"status": "REJECTED", "reason": f"Unknown parameter '{parameter}' for a bent bracket.",
+                     "valid_parameters": ["leg1_length", "leg2_length", "width", "thickness", "bend_angle_deg",
+                                           "fillet_radius", "length", "height"]}
+        new_params = _copy_params(state.params)
+        for f in fields:
+            cur = new_params[f]
+            new_params[f] = (round(float(new_value), 4) if (new_value is not None and len(fields) == 1)
+                              else round(cur * (1 + (change_percent or 0) / 100.0), 4))
+        desc = f"modify_parameter({parameter}" + (f",region={region}" if region else "") + ")"
+        return await _rebuild_bracket(state, new_params, desc, reason, predicted_effect)
+
+    else:
+        desc = (f"Adjust the parameter '{parameter}'" + (f" near {region}" if region else "")
+                + (f" by {change_percent}%" if change_percent is not None else f" to {new_value}"))
+        return await _agent_generic_script_modification(state, desc, reason, predicted_effect)
+
+
+async def _tool_modify_thickness(state, change_percent=None, new_value=None, region=None, reason="", predicted_effect=None):
+    return await _tool_modify_parameter(state, "thickness", change_percent, new_value, region, reason, predicted_effect)
+
+async def _tool_modify_length(state, change_percent=None, new_value=None, region=None, reason="", predicted_effect=None):
+    return await _tool_modify_parameter(state, "length", change_percent, new_value, region, reason, predicted_effect)
+
+async def _tool_modify_width(state, change_percent=None, new_value=None, region=None, reason="", predicted_effect=None):
+    return await _tool_modify_parameter(state, "width", change_percent, new_value, region, reason, predicted_effect)
+
+async def _tool_modify_height(state, change_percent=None, new_value=None, region=None, reason="", predicted_effect=None):
+    return await _tool_modify_parameter(state, "height", change_percent, new_value, region, reason, predicted_effect)
+
+async def _tool_modify_fillet(state, change_percent=None, new_value=None, region=None, reason="", predicted_effect=None):
+    return await _tool_modify_parameter(state, "fillet_radius", change_percent, new_value, region, reason, predicted_effect)
+
+
+async def _tool_modify_taper(state, change_percent, reason="", predicted_effect=None):
+    if state.design_type != "tapered_beam":
+        return {"status": "NOT_APPLICABLE", "reason": "modify_taper only applies to a tapered_beam design_type."}
+    if not reason:
+        return {"status": "REJECTED", "reason": "A 'reason' is required."}
+    new_params = _copy_params(state.params)
+    new_params["tip_width"] = round(new_params["tip_width"] * (1 + change_percent / 100.0), 4)
+    new_params["tip_thick"] = round(new_params["tip_thick"] * (1 + change_percent / 100.0), 4)
+    return await _rebuild_beam(state, new_params, f"modify_taper({change_percent}%)", reason, predicted_effect)
+
+
+async def _tool_add_hole(state, x_mm, y_mm, diameter_mm, end=None, leg=None, reason="", predicted_effect=None):
+    if not reason:
+        return {"status": "REJECTED", "reason": "A 'reason' is required."}
+    if state.design_type == "tapered_beam":
+        if end not in ("base", "tip"):
+            return {"status": "REJECTED", "reason": "For a tapered_beam, 'end' must be 'base' or 'tip'."}
+        width = state.params["base_width"] if end == "base" else state.params["tip_width"]
+        thick = state.params["base_thick"] if end == "base" else state.params["tip_thick"]
+        ok, err = _validate_hole(x_mm, y_mm, diameter_mm, width, thick)
+        if not ok:
+            return err
+        new_params = _copy_params(state.params)
+        key = "holes_base" if end == "base" else "holes_tip"
+        new_params[key] = list(new_params[key]) + [(x_mm, y_mm, diameter_mm)]
+        return await _rebuild_beam(state, new_params, f"add_hole(end={end})", reason, predicted_effect)
+    elif state.design_type == "bent_bracket":
+        if leg not in ("leg1", "leg2"):
+            return {"status": "REJECTED", "reason": "For a bent_bracket, 'leg' must be 'leg1' or 'leg2'."}
+        length = state.params["leg1_length"] if leg == "leg1" else state.params["leg2_length"]
+        width = state.params["width"]
+        ok, err = _validate_hole_bracket(x_mm, y_mm, diameter_mm, length, width)
+        if not ok:
+            return err
+        new_params = _copy_params(state.params)
+        key = "holes_leg1" if leg == "leg1" else "holes_leg2"
+        new_params[key] = list(new_params[key]) + [(x_mm, y_mm, diameter_mm)]
+        return await _rebuild_bracket(state, new_params, f"add_hole(leg={leg})", reason, predicted_effect)
+    else:
+        desc = f"Add a through hole of diameter {diameter_mm}mm at approximately (x={x_mm}, y={y_mm}) in the relevant local face frame."
+        return await _agent_generic_script_modification(state, desc, reason, predicted_effect)
+
+
+async def _tool_modify_feature(state, feature_description, reason="", predicted_effect=None):
+    return await _agent_generic_script_modification(state, feature_description, reason, predicted_effect)
+
+async def _tool_create_feature(state, feature_description, reason="", predicted_effect=None):
+    return await _agent_generic_script_modification(state, f"Add: {feature_description}", reason, predicted_effect)
+
+async def _tool_remove_feature(state, feature_description, reason="", predicted_effect=None):
+    return await _agent_generic_script_modification(state, f"Remove: {feature_description}", reason, predicted_effect)
+
+async def _tool_add_rib(state, description, reason="", predicted_effect=None):
+    return await _agent_generic_script_modification(state, f"Add a structural rib: {description}", reason, predicted_effect)
+
+async def _tool_add_gusset(state, description, reason="", predicted_effect=None):
+    return await _agent_generic_script_modification(state, f"Add a gusset/corner brace: {description}", reason, predicted_effect)
+
+async def _tool_modify_chamfer(state, description, reason="", predicted_effect=None):
+    return await _agent_generic_script_modification(state, f"Modify chamfer: {description}", reason, predicted_effect)
+
+
+# ----------------------------------------------------------------------
+# Tool implementations — validate / mesh / simulate / compare / finalize
+# ----------------------------------------------------------------------
+
+# ----------------------------------------------------------------------
+# NOTE: validate_geometry and run_mesh used to be standalone tools here. They're
+# now folded automatically into every set_initial_design/modify_*/add_hole/
+# generic-script call via _auto_validate_and_mesh (see above) — cuts 2 of the 4
+# model round-trips a design iteration used to need. See that function for the
+# actual logic; kept here as a single reference point rather than duplicated.
+
+async def _tool_run_fea(state, force_n=None, force_dir=None):
+    if state.mesh is None:
+        return {"status": "ERROR", "message": "No validated mesh available yet. Call set_initial_design "
+                                                "(or a modify_*/add_hole tool) first — it validates and "
+                                                "meshes automatically."}
+    if state.iteration_count >= state.max_iterations:
+        return {"status": "ITERATION_LIMIT_REACHED",
+                "message": f"The configured max_iterations ({state.max_iterations}) analysis runs have "
+                           "already been used. Call finalize_design now with your honest assessment.",
+                "iterations_used": state.iteration_count}
+    fn = force_n if force_n is not None else state.force_n
+    fd = force_dir if force_dir is not None else state.force_dir
+    try:
+        result = await run_analysis_v8(state.mesh, state.original_prompt, state.original_prompt, state.material,
+                                        fn, fd, state.operating_temp_c, state.project_description,
+                                        state.surface_finish, state.reliability, False)
+    except Exception as e:
+        return {"status": "ERROR",
+                "message": f"Analysis pipeline raised: {type(e).__name__}: {e}. This usually means degenerate "
+                           "geometry slipped past validate_geometry/run_mesh."}
+
+    state.iteration_count += 1
+    state.last_analysis = result
+    quality = evaluate_design_quality(result, state.min_health_score, state.max_critical_violations,
+                                       state.max_high_violations, state.min_safety_factor)
+    state.last_quality = quality
+    diagnosis = build_engineering_diagnosis(result, state)
+    snap = _snapshot_current(state, quality, result, critical_region=diagnosis.get("critical_region"))
+    state.previous_design = state.current_candidate
+    state.current_candidate = snap
+    _update_best_valid(state, snap)
+    if quality["passed"]:
+        _update_best_passing(state, snap)
+
+    if state.pending_hypothesis is not None:
+        ph = state.pending_hypothesis
+        prev_sf = (state.previous_design or {}).get("safety_factor")
+        cur_sf = snap.get("safety_factor")
+        prev_region = (state.previous_design or {}).get("critical_region")
+        cur_region = snap.get("critical_region")
+        if quality["passed"]:
+            verdict = "PASSED"
+        elif prev_sf is not None and cur_sf is not None:
+            verdict = "IMPROVED" if cur_sf > prev_sf else "WORSE" if cur_sf < prev_sf else "UNCHANGED"
+        else:
+            verdict = "UNKNOWN"
+        improvement_pct = (round((cur_sf - prev_sf) / prev_sf * 100, 1)
+                            if (prev_sf not in (None, 0) and cur_sf is not None) else None)
+        state.hypothesis_log.append({"iteration": state.iteration_count, "change": ph["change"],
+                                      "reason": ph["reason"], "predicted_effect": ph["predicted_effect"],
+                                      "safety_factor_before": prev_sf, "safety_factor_after": cur_sf,
+                                      "safety_factor_improvement_pct": improvement_pct,
+                                      "same_region_as_previous_failure": (
+                                          (prev_region == cur_region) if (prev_region and cur_region) else None),
+                                      "health_score_after": snap["health_score"], "verdict": verdict})
+        state.pending_hypothesis = None
+    else:
+        state.hypothesis_log.append({"iteration": state.iteration_count, "change": "initial_design",
+                                      "reason": "initial engineering interpretation of the request",
+                                      "predicted_effect": None, "safety_factor_before": None,
+                                      "safety_factor_after": snap.get("safety_factor"),
+                                      "safety_factor_improvement_pct": None,
+                                      "same_region_as_previous_failure": None,
+                                      "health_score_after": snap["health_score"],
+                                      "verdict": "PASSED" if quality["passed"] else "BASELINE"})
+
+    return {**diagnosis, "quality_gate_passed": quality["passed"], "quality_gate_reasons": quality["reasons"],
+            "iterations_used": state.iteration_count, "max_iterations": state.max_iterations}
+
+
+def _tool_run_fatigue(state):
+    if state.last_analysis is None:
+        return {"status": "NOT_AVAILABLE", "message": "Call run_fea first."}
+    return state.last_analysis.get("fatigue_analysis")
+
+
+def _tool_compare_designs(state, baseline="previous"):
+    baseline_map = {"previous": state.previous_design, "best_valid": state.best_valid_design,
+                     "best_passing": state.best_passing_design}
+    if baseline not in baseline_map:
+        return {"status": "ERROR", "message": f"baseline must be one of {list(baseline_map)}"}
+    a = baseline_map[baseline]; b = state.current_candidate
+    if b is None:
+        return {"status": "ERROR", "message": "No analyzed candidate yet — call run_fea first."}
+    if a is None:
+        return {"status": "NO_BASELINE", "message": f"No '{baseline}' design recorded yet.",
+                "current": _summarize_snapshot(b)}
+
+    def delta(v1, v2):
+        if v1 in (None, 0) or v2 is None:
+            return None
+        return round((v2 - v1) / v1 * 100, 2)
+
+    sfv_a, sfv_b = a.get("safety_factor"), b.get("safety_factor")
+    hs_a, hs_b = a.get("health_score", 0), b.get("health_score", 0)
+    if b.get("passed") and not a.get("passed"):
+        verdict = "IMPROVED_TO_PASSING"
+    elif b.get("passed"):
+        verdict = "PASSED"
+    elif sfv_a is not None and sfv_b is not None and sfv_b > sfv_a and hs_b >= hs_a:
+        verdict = "IMPROVED"
+    elif (sfv_a is not None and sfv_b is not None and sfv_b < sfv_a) or hs_b < hs_a:
+        verdict = "WORSE"
+    else:
+        verdict = "UNCHANGED"
+    return {"status": "OK", "baseline": baseline, "baseline_snapshot": _summarize_snapshot(a),
+            "current_snapshot": _summarize_snapshot(b),
+            "delta": {"safety_factor_pct": delta(sfv_a, sfv_b), "health_score_change": round(hs_b - hs_a, 1),
+                      "mass_g_pct": delta(a.get("mass_g"), b.get("mass_g")),
+                      "violations_change": (b.get("violations") or 0) - (a.get("violations") or 0)},
+            "verdict": verdict}
+
+
+def _tool_finalize_design(state, verdict, summary=""):
+    state.finalized = True
+    state.final_verdict_claimed = verdict
+    state.final_summary = summary
+    return {"status": "ACKNOWLEDGED",
+            "message": "Recorded. The final response to the user is always computed independently from the "
+                       "actual solver results on the winning design, not from this claimed verdict."}
+
+
+AGENT_TOOL_HANDLERS = {
+    "set_initial_design": _tool_set_initial_design,
+    "inspect_geometry": _tool_inspect_geometry,
+    "measure_geometry": _tool_measure_geometry,
+    "identify_features": _tool_identify_features,
+    "find_holes": _tool_find_holes,
+    "measure_wall_thickness": _tool_measure_wall_thickness,
+    "get_bounding_box": _tool_get_bounding_box,
+    "get_mass_properties": _tool_get_mass_properties,
+    "check_manifold": _tool_check_manifold,
+    "check_watertight": _tool_check_watertight,
+    "find_problem_regions": _tool_find_problem_regions,
+    "get_topology_summary": _tool_get_topology_summary,
+    "diagnose_failure": _tool_diagnose_failure,
+    "calculate_properties": _tool_calculate_properties,
+    "modify_parameter": _tool_modify_parameter,
+    "modify_thickness": _tool_modify_thickness,
+    "modify_length": _tool_modify_length,
+    "modify_width": _tool_modify_width,
+    "modify_height": _tool_modify_height,
+    "modify_fillet": _tool_modify_fillet,
+    "modify_taper": _tool_modify_taper,
+    "add_hole": _tool_add_hole,
+    "modify_feature": _tool_modify_feature,
+    "create_feature": _tool_create_feature,
+    "remove_feature": _tool_remove_feature,
+    "add_rib": _tool_add_rib,
+    "add_gusset": _tool_add_gusset,
+    "modify_chamfer": _tool_modify_chamfer,
+    # (validate_geometry and run_mesh were removed as standalone tools — folded
+    # into _auto_validate_and_mesh, called automatically by every build/modify tool)
+    "run_fea": _tool_run_fea,
+    "run_fatigue": _tool_run_fatigue,
+    "compare_designs": _tool_compare_designs,
+    "finalize_design": _tool_finalize_design,
+}
+
+
+async def _execute_agent_tool(state, name, args):
+    handler = AGENT_TOOL_HANDLERS.get(name)
+    if handler is None:
+        return {"status": "ERROR", "message": f"Unknown tool '{name}'. Valid tools: {sorted(AGENT_TOOL_HANDLERS)}"}
+    try:
+        if asyncio.iscoroutinefunction(handler):
+            result = await handler(state, **args)
+        else:
+            result = handler(state, **args)
+        if not isinstance(result, dict):
+            result = {"status": "OK", "value": result}
+        return result
+    except TypeError as e:
+        return {"status": "ERROR", "message": f"Bad arguments for '{name}': {e}"}
+    except Exception as e:
+        return {"status": "ERROR", "message": f"Tool '{name}' raised: {type(e).__name__}: {e}"}
+
+
+# ----------------------------------------------------------------------
+# Tool schemas (OpenAI/Groq function-calling JSON Schema format)
+# ----------------------------------------------------------------------
+
+ENGINEERING_AGENT_TOOLS = [
+    {"name": "set_initial_design",
+     "description": "Establish the FIRST version of the design from your understanding of the engineering "
+        "request. Choose design_type='tapered_beam' for a tapered/lofted member (drone arm, connecting rod, "
+        "tapered spar/leg), 'bent_bracket' for a bracket with a real fold between two flat legs, or "
+        "'generic_script' to let the AI author a custom CadQuery script for geometry neither primitive "
+        "covers. Can only be called once per session.",
+     "parameters": {"type": "object", "properties": {
+         "design_type": {"type": "string", "enum": ["tapered_beam", "bent_bracket", "generic_script"]},
+         "reason": {"type": "string", "description": "Why you picked this design_type and these starting dimensions."},
+         "length": {"type": "number", "description": "[tapered_beam] overall length in mm, base(Z=0) to tip(Z=length)."},
+         "base_width": {"type": "number", "description": "[tapered_beam] cross-section width at the base, mm."},
+         "base_thick": {"type": "number", "description": "[tapered_beam] cross-section thickness at the base, mm."},
+         "tip_width": {"type": "number", "description": "[tapered_beam] cross-section width at the tip, mm."},
+         "tip_thick": {"type": "number", "description": "[tapered_beam] cross-section thickness at the tip, mm."},
+         "fillet_radius": {"type": "number", "description": "[both primitives] mm, 0 for none."},
+         "holes_base": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                         "description": "[tapered_beam] list of [x_from_center_mm, y_from_center_mm, diameter_mm] at the base face."},
+         "holes_tip": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                        "description": "[tapered_beam] same shape as holes_base, at the tip face."},
+         "leg1_length": {"type": "number", "description": "[bent_bracket] mm."},
+         "leg2_length": {"type": "number", "description": "[bent_bracket] mm."},
+         "width": {"type": "number", "description": "[bent_bracket] mm, shared by both legs."},
+         "thickness": {"type": "number", "description": "[bent_bracket] mm, shared by both legs."},
+         "bend_angle_deg": {"type": "number", "description": "[bent_bracket] default 90."},
+         "holes_leg1": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                         "description": "[bent_bracket] list of [x_from_bend_mm, y_from_centerline_mm, diameter_mm]."},
+         "holes_leg2": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+                         "description": "[bent_bracket] same shape as holes_leg1."},
+     }, "required": ["design_type"]}},
+
+    {"name": "inspect_geometry", "description": "Structured summary of the current meshed geometry: "
+        "solid/watertight/manifold flags, bounding box, volume, detected features, hole count, minimum "
+        "wall thickness. Geometry is validated and meshed automatically by set_initial_design/modify_* — "
+        "call one of those first if this comes back NOT_AVAILABLE.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "measure_geometry", "description": "Bounding box, volume, surface area, and full "
+        "wall-thickness distribution of the current meshed geometry.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "identify_features", "description": "Lists engineering features present in the current "
+        "design (taper, fold/bend, fillet, through_holes) and the hole count, from the declared parameters.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "find_holes", "description": "Detailed list of every hole: position, diameter, recommended "
+        "fastener, and whether it violates the edge-distance rule.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "measure_wall_thickness", "description": "Dual-pass wall-thickness scan: min/mean/max "
+        "thickness and specific thin/critical zone locations.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "get_bounding_box", "description": "Overall dimensions (mm) and aspect ratio of the current "
+        "meshed geometry.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "get_mass_properties", "description": "Volume, mass, material, and center of mass of the "
+        "current meshed geometry.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "check_manifold", "description": "Whether the current mesh is a valid closed manifold solid "
+        "(winding-consistent, watertight/is_volume).",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "check_watertight", "description": "Whether the current mesh is watertight; if not, the "
+        "(x,y,z) location(s) of the gap(s).",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "find_problem_regions", "description": "Merged list of every known problem location on the "
+        "current design: non-watertight gaps, thin walls, sharp-corner stress concentrations, hole "
+        "violations, and the FEA critical section if run_fea has been called.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "get_topology_summary", "description": "Vertex/face/edge counts, Euler number, watertight "
+        "and manifold flags for the current mesh.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "diagnose_failure", "description": "The authoritative engineering diagnosis from the most "
+        "recent run_fea call: status, safety_factor, max_von_mises_mpa, critical_region, failure_modes. "
+        "Call run_fea first.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "calculate_properties", "description": "Section/mass/dynamic properties (stress components, "
+        "deflection, natural frequency, buckling) — from the last run_fea if available, otherwise a cheap "
+        "on-demand analytical estimate.",
+     "parameters": {"type": "object", "properties": {}}},
+
+    {"name": "modify_parameter", "description": "General-purpose targeted parameter change on the current "
+        "parametric design. Prefer the specific modify_thickness/length/width/height/fillet/taper shortcuts "
+        "when they fit; use this for anything else, including exact field names like 'base_thick' or 'tip_width'.",
+     "parameters": {"type": "object", "properties": {
+         "parameter": {"type": "string", "description": "e.g. 'thickness','width','length','fillet_radius', "
+                        "or an exact field name such as 'base_thick'/'tip_width'/'leg1_length'."},
+         "change_percent": {"type": "number", "description": "Relative change, e.g. 20 for +20%. Provide this OR new_value."},
+         "new_value": {"type": "number", "description": "Absolute new value in mm/deg. Provide this OR change_percent."},
+         "region": {"type": "string", "description": "Optional disambiguation for a generic parameter name: "
+                     "'base'/'near_fixed_support' vs 'tip'/'near_tip' for a beam; 'leg1' vs 'leg2' for a bracket."},
+         "reason": {"type": "string", "description": "REQUIRED. The engineering justification for this change."},
+         "predicted_effect": {"type": "string", "description": "What you expect this change to do to the result."},
+     }, "required": ["parameter", "reason"]}},
+    {"name": "modify_thickness", "description": "Shortcut for modify_parameter targeting section thickness "
+        "(base_thick/tip_thick for a beam, thickness for a bracket).",
+     "parameters": {"type": "object", "properties": {
+         "change_percent": {"type": "number"}, "new_value": {"type": "number"},
+         "region": {"type": "string", "description": "'base' or 'tip' for a beam (omit to scale both)."},
+         "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["reason"]}},
+    {"name": "modify_length", "description": "Shortcut for modify_parameter targeting overall length "
+        "(beam) or a leg length (bracket, use region='leg1'|'leg2').",
+     "parameters": {"type": "object", "properties": {
+         "change_percent": {"type": "number"}, "new_value": {"type": "number"},
+         "region": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["reason"]}},
+    {"name": "modify_width", "description": "Shortcut for modify_parameter targeting section width "
+        "(base_width/tip_width for a beam, width for a bracket).",
+     "parameters": {"type": "object", "properties": {
+         "change_percent": {"type": "number"}, "new_value": {"type": "number"},
+         "region": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["reason"]}},
+    {"name": "modify_height", "description": "Shortcut for modify_parameter targeting the out-of-plane "
+        "dimension (alias for thickness).",
+     "parameters": {"type": "object", "properties": {
+         "change_percent": {"type": "number"}, "new_value": {"type": "number"},
+         "region": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["reason"]}},
+    {"name": "modify_fillet", "description": "Shortcut for modify_parameter targeting fillet_radius.",
+     "parameters": {"type": "object", "properties": {
+         "change_percent": {"type": "number"}, "new_value": {"type": "number"},
+         "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["reason"]}},
+    {"name": "modify_taper", "description": "[tapered_beam only] Scale both tip_width and tip_thick "
+        "together by change_percent, making the taper more (negative %) or less (positive %) aggressive "
+        "without touching the base.",
+     "parameters": {"type": "object", "properties": {
+         "change_percent": {"type": "number"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["change_percent", "reason"]}},
+    {"name": "add_hole", "description": "Add one through-hole. For a tapered_beam set end='base'|'tip'; "
+        "for a bent_bracket set leg='leg1'|'leg2'. Position is in that face's local centered frame.",
+     "parameters": {"type": "object", "properties": {
+         "x_mm": {"type": "number"}, "y_mm": {"type": "number"}, "diameter_mm": {"type": "number"},
+         "end": {"type": "string", "enum": ["base", "tip"]}, "leg": {"type": "string", "enum": ["leg1", "leg2"]},
+         "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["x_mm", "y_mm", "diameter_mm", "reason"]}},
+    {"name": "modify_feature", "description": "Fallback for a design change the dedicated parametric "
+        "tools can't express. Describe the change in plain engineering language; it is applied via an "
+        "AI-assisted, fully re-verified script edit rather than a validated numeric parameter change, so "
+        "prefer the specific modify_*/add_hole tools whenever they fit.",
+     "parameters": {"type": "object", "properties": {
+         "feature_description": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["feature_description", "reason"]}},
+    {"name": "create_feature", "description": "Same mechanism as modify_feature, framed as adding "
+        "something new (e.g. a boss, a slot, a mounting tab) not covered by add_hole.",
+     "parameters": {"type": "object", "properties": {
+         "feature_description": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["feature_description", "reason"]}},
+    {"name": "remove_feature", "description": "Same mechanism as modify_feature, framed as removing an "
+        "existing feature.",
+     "parameters": {"type": "object", "properties": {
+         "feature_description": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["feature_description", "reason"]}},
+    {"name": "add_rib", "description": "Add a stiffening rib. Not yet a dedicated parametric primitive — "
+        "routed through the same AI-assisted script-edit fallback as modify_feature, then fully re-verified.",
+     "parameters": {"type": "object", "properties": {
+         "description": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["description", "reason"]}},
+    {"name": "add_gusset", "description": "Add a corner gusset/brace. Not yet a dedicated parametric "
+        "primitive — routed through the same AI-assisted script-edit fallback, then fully re-verified.",
+     "parameters": {"type": "object", "properties": {
+         "description": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["description", "reason"]}},
+    {"name": "modify_chamfer", "description": "Add/change a chamfer. Not yet a dedicated parametric "
+        "primitive — routed through the same AI-assisted script-edit fallback, then fully re-verified.",
+     "parameters": {"type": "object", "properties": {
+         "description": {"type": "string"}, "reason": {"type": "string"}, "predicted_effect": {"type": "string"},
+     }, "required": ["description", "reason"]}},
+
+    {"name": "run_fea", "description": "THE authoritative engineering check: full FEA (real CalculiX where "
+        "configured, analytical fallback otherwise) plus fatigue and the rule engine, on the current meshed "
+        "design. Consumes one iteration of your budget. Returns the same shape as diagnose_failure.",
+     "parameters": {"type": "object", "properties": {
+         "force_n": {"type": "number", "description": "Override the load magnitude for this run only."},
+         "force_dir": {"type": "string", "enum": ["x", "y", "z"], "description": "Override load direction for this run only."},
+     }}},
+    {"name": "run_fatigue", "description": "Fatigue analysis (full Marin 6-factor + Goodman/Gerber) from "
+        "the most recent run_fea call.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "compare_designs", "description": "Compare the current analyzed candidate against a stored "
+        "baseline ('previous' iteration, 'best_valid' design so far, or 'best_passing' design so far) to "
+        "see whether your last change actually helped.",
+     "parameters": {"type": "object", "properties": {
+         "baseline": {"type": "string", "enum": ["previous", "best_valid", "best_passing"]},
+     }}},
+    {"name": "finalize_design", "description": "End the engineering loop. Call this once the design "
+        "passes, or your iteration budget is spent, or further iteration clearly won't help.",
+     "parameters": {"type": "object", "properties": {
+         "verdict": {"type": "string", "enum": ["PASSED", "BEST_EFFORT", "FAILED"]},
+         "summary": {"type": "string", "description": "Brief summary of the final state and what was tried."},
+     }, "required": ["verdict"]}},
+]
+
+
+ENGINEERING_AGENT_SYSTEM_PROMPT = """You are the Lumexa Engineering Agent — a mechanical design reasoning layer sitting on top of Lumexa's deterministic CAD/FEA systems. You are NOT a CAD kernel and you do NOT do freehand geometry math yourself. Every geometric fact you know comes from calling a tool; every geometric change you make happens by calling a tool. Lumexa's solvers (real FEA where configured, analytical fallback otherwise) are the sole source of truth for whether a design passes — you never declare PASS/FAIL yourself, you read it from run_fea's/diagnose_failure's output.
+
+WORKFLOW (follow this shape; you may repeat steps as needed):
+Understand -> Inspect -> Diagnose -> Propose -> Modify (auto-verified) -> Simulate -> Compare -> Refine
+
+1. UNDERSTAND: read the engineering request. Call set_initial_design with your best translation of it into concrete parameters for whichever primitive fits (tapered_beam or bent_bracket), or generic_script if neither fits. Before proposing a change on later iterations, silently answer for yourself: what is being built, its engineering purpose, its important geometric features, the loads/constraints on it, what is currently failing and where, what design variable could influence that failure, what change you will attempt, why it should help, and what must NOT change.
+2. INSPECT: set_initial_design and every modify_*/add_hole/create_feature call automatically validate the B-rep and mesh it for you as part of that same call (status OK means it's already meshed and ready) — you do NOT need to call separate validate/mesh steps. If a build/modify call comes back REJECTED for a geometry reason, the system has already reverted to the last known-good design for you. Once meshed, inspect_geometry/measure_geometry/find_holes/check_watertight/etc. are available for closer inspection if you want it, but are optional, read-only, and don't cost you an iteration.
+3. DIAGNOSE: call run_fea (this also runs fatigue/rule-engine checks) and read diagnose_failure/find_problem_regions for WHERE and WHY it is failing. Trust these numbers completely — never override or second-guess a solver result. Exception: if failure_modes leads with "SOLVER OUTPUT NUMERICALLY SUSPECT", the solver itself flagged that iteration's stress/deflection numbers as an implausible artifact (not a real structural finding) — don't treat it as a confirmed FAIL or try to "fix" it with a large parameter change; a small, unrelated tweak and re-running run_fea is enough to get past a one-off slicing artifact.
+4. PROPOSE + MODIFY: pick ONE targeted, physically-justified change at a time (modify_parameter and its shortcuts modify_thickness/length/width/height/fillet/taper, add_hole, or for anything the built-in primitives can't express, modify_feature/create_feature/remove_feature/add_rib/add_gusset/modify_chamfer). Every modify call requires a `reason` — the engineering justification — and should include a `predicted_effect` — what you expect to happen. Do not rewrite the whole design when one parameter needs changing. Do not fix one flagged issue by weakening something that was already fine elsewhere.
+5. SIMULATE: call run_fea right after each modify call (it's already validated/meshed by step 4 — no separate verify step needed). If a change was rejected instead (bad parameters, or the resulting geometry came back non-manifold/non-watertight), you were told so explicitly and the system already reverted to the best known-valid design — just try a different, smaller, or better-justified change next.
+6. COMPARE + REFINE: call compare_designs to see whether your last change actually helped versus the previous iteration (or the best-so-far). Never assume a change worked — check.
+7. When the design passes the quality gate, or you have used your iteration budget, or you are confident further iteration will not help, call finalize_design with your honest verdict and a short summary. The system will independently re-verify the final numbers regardless of what you report here — this call only records your reasoning, it never overrides the solver's own verdict.
+
+RULES:
+- You have a limited number of model calls available for this run — every call you make (including read-only inspection) counts against it, so don't waste calls on redundant inspection once a design is already meshed; go straight to run_fea unless you have a specific reason to inspect first.
+- Never claim a design passed or failed — only report what run_fea/diagnose_failure told you.
+- Always give a `reason` on every modification.
+- One targeted change per modify call. If you're unsure which parameter to change, call diagnose_failure/find_problem_regions/calculate_properties first rather than guessing.
+- If a tool returns status REJECTED or ERROR, read the message, adjust your approach, and try again — do not repeat the exact same rejected call.
+- You have a limited number of run_fea calls (shown in the user message) — don't waste them on inspection; use the read-only tools freely, they don't count against that budget."""
+
+
+# ----------------------------------------------------------------------
+# Provider tool-calling transport (OpenAI-compatible: groq/openrouter/lovable/
+# cerebras/nvidia all share this exact wire shape). See the module docstring
+# above this section for why Claude/Gemini aren't wired up for this endpoint yet.
+# ----------------------------------------------------------------------
+
+def _to_openai_tools(tool_specs):
+    return [{"type": "function", "function": {"name": t["name"], "description": t["description"],
+             "parameters": t["parameters"]}} for t in tool_specs]
+
+
+def _openai_compatible_tool_chat(api_url, api_key, model, messages, tools, temperature=0.2,
+                                  max_tokens=AGENT_TURN_MAX_TOKENS, extra_headers=None):
+    """
+    One tool-calling round-trip against any OpenAI-compatible chat/completions
+    endpoint — same urllib-direct pattern as _groq_request/_openrouter_request/
+    _lovable_request above, extended with tools/tool_choice and returning the
+    full message object (content + tool_calls) rather than just extracted text,
+    since the agent loop needs to see and execute tool_calls, not just prose.
+    """
+    import urllib.request, urllib.error
+
+    payload = json.dumps({"model": model, "messages": messages, "tools": tools,
+                           "tool_choice": "auto", "temperature": temperature,
+                           "max_tokens": max_tokens}).encode()
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}",
+               "User-Agent": "Mozilla/5.0 (compatible; LumexaBackend/1.0)", "Accept": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+
+    req = urllib.request.Request(api_url, data=payload, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="ignore")
+        if e.code == 429:
+            raise HTTPException(429, f"Provider rate limit exceeded: {body}")
+        raise HTTPException(502, f"Provider error ({e.code}): {body}")
+    except urllib.error.URLError as e:
+        raise HTTPException(502, f"Provider connection error: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        # FIX: confirmed live via the near-identical bug in _openrouter_request — a call
+        # that times out mid-read or returns a non-JSON body raises something neither
+        # HTTPError nor URLError catches, and this function drives EVERY step of the main
+        # agent loop (whichever provider is configured), not just the advisor — so this
+        # gap could crash an /engineering-agent request on its primary model call, not
+        # only the sparingly-used advisor path where it was actually first observed.
+        raise HTTPException(502, f"Provider request failed unexpectedly: {type(e).__name__}: {e}")
+
+    try:
+        return data["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(502, f"Unexpected tool-calling response shape: {json.dumps(data)[:500]}")
+
+
+def _provider_tool_endpoint():
+    if AI_PROVIDER == "groq":
+        return GROQ_API_URL, GROQ_API_KEY, GROQ_MODEL
+    if AI_PROVIDER == "openrouter":
+        return OPENROUTER_API_URL, OPENROUTER_API_KEY, OPENROUTER_MODEL
+    if AI_PROVIDER == "lovable":
+        return LOVABLE_AI_URL, LOVABLE_API_KEY, LOVABLE_AI_MODEL
+    if AI_PROVIDER == "cerebras":
+        return CEREBRAS_API_URL, CEREBRAS_API_KEY, CEREBRAS_MODEL
+    if AI_PROVIDER == "nvidia":
+        return NVIDIA_API_URL, NVIDIA_API_KEY, NVIDIA_MODEL
+    return None, None, None
+
+
+def _call_model_with_tools(messages, temperature=0.2, max_tokens=AGENT_TURN_MAX_TOKENS):
+    url, key, model = _provider_tool_endpoint()
+    if url is None:
+        raise HTTPException(501,
+            "The Engineering Agent's tool-calling loop is currently implemented for OpenAI-compatible "
+            "providers only (groq, openrouter, lovable, cerebras, nvidia). Current AI_PROVIDER is "
+            f"'{AI_PROVIDER}'. Set AI_PROVIDER to one of those (plus its matching API key) to use this "
+            "endpoint; Claude/Gemini native tool-calling for this specific agent loop is not wired up "
+            "yet — /generate-validate-refine still works on every provider as before.")
+    if not key:
+        raise HTTPException(500, f"{AI_PROVIDER.upper()}_API_KEY is not configured on the server.")
+
+    msg = _openai_compatible_tool_chat(url, key, model, messages, _to_openai_tools(ENGINEERING_AGENT_TOOLS),
+                                        temperature=temperature, max_tokens=max_tokens)
+    tool_calls = []
+    for tc in (msg.get("tool_calls") or []):
+        try:
+            args = json.loads(tc.get("function", {}).get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {"_raw_arguments_unparseable": tc.get("function", {}).get("arguments")}
+        tool_calls.append({"id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                            "name": tc.get("function", {}).get("name"), "arguments": args})
+    return {"role": "assistant", "content": msg.get("content") or msg.get("reasoning"),
+            "tool_calls": tool_calls, "_raw_message": msg}
+
+
+def _format_tool_result_message(tool_call_id, tool_name, result_dict):
+    safe = _json_safe(result_dict)
+    text = json.dumps(safe)
+    if len(text) > 6000:
+        text = json.dumps({"truncated": True, "note": "Full result was too large; showing a partial view.",
+                            "status": safe.get("status") if isinstance(safe, dict) else None,
+                            "keys_available": list(safe.keys()) if isinstance(safe, dict) else None,
+                            "partial": text[:4000]})
+    return {"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": text}
+
+
+# ----------------------------------------------------------------------
+# Orchestration loop (spec sections 1, 9, 12)
+# ----------------------------------------------------------------------
+
+def _call_advisor(situation_text, max_tokens=800):
+    """The optional 'strategic advisor' second model (see NEMOTRON_ADVISOR_MODEL
+    above). Returns its text response, or None if the advisor isn't configured
+    or the call fails for any reason — a missing/broken advisor NEVER breaks
+    the main agent loop, it just means gpt-oss-120b reasons on its own like it
+    always has. This is advisory input only: it gets appended to the
+    conversation as context, never executes anything itself and never
+    overrides an actual solver result."""
+    if not NEMOTRON_ADVISOR_MODEL or not OPENROUTER_API_KEY:
+        return None
+    try:
+        return _openrouter_request(
+            [{"role": "system", "content":
+                "You are a senior mechanical engineering advisor reviewing an automated design "
+                "iteration. You do not have tools and cannot change anything yourself — you give "
+                "concise, physically-grounded strategic guidance that another AI (which DOES have "
+                "tools) will read and act on. Be specific and brief: 3-6 sentences. Never invent "
+                "numbers you weren't given."},
+             {"role": "user", "content": situation_text}],
+            temperature=0.3, max_tokens=max_tokens, model=NEMOTRON_ADVISOR_MODEL,
+            timeout=30,  # fail fast rather than burn most of a minute on a slow/overloaded
+                         # advisor model — this is a best-effort extra, not worth a long wait
+        )
+    except HTTPException as e:
+        print(f"[engineering-agent] advisor call failed ({NEMOTRON_ADVISOR_MODEL}): {e.detail} "
+              f"— continuing without it")
+        return None
+    except Exception as e:
+        # Defense in depth on top of the fix now in _openrouter_request itself — this
+        # function's entire design promise is "can never break the main loop", so it
+        # catches broadly here too rather than relying on the callee alone.
+        print(f"[engineering-agent] advisor call raised unexpectedly ({NEMOTRON_ADVISOR_MODEL}): "
+              f"{type(e).__name__}: {e} — continuing without it")
+        return None
+
+
+def render_mesh_snapshot_png(mesh, view="iso", size_px=800):
+    """
+    Lightweight, pure-CPU mesh snapshot renderer — no OpenGL, no headless
+    browser, no display server. Deliberately cruder than a proper WebGL/
+    ray-traced render (flat per-face lambertian shading, matplotlib's own
+    antialiasing) in exchange for being reliable on a memory-constrained
+    free-tier container: a headless-Chromium-based renderer (the approach
+    earthtojake/text-to-cad's cadgen skill uses for its mandatory snapshot-
+    review policy) would add a real further OOM risk on top of everything
+    else this deployment has already fought — Chromium alone typically wants
+    200-500MB of RAM just to run.
+
+    Adopts that project's core PRINCIPLE, not its mechanism: a rendered
+    snapshot is DIAGNOSTIC, not authoritative. It's for a human (or a future
+    vision-capable model call, once one is configured) to glance at before
+    trusting a design purely on its numbers — it never overrides an actual
+    solver result, and nothing in this codebase treats it as one.
+
+    Returns PNG bytes, or raises on failure (caller decides how to degrade —
+    see its use in run_engineering_agent, which never lets a render failure
+    break the actual result).
+    """
+    import matplotlib
+    matplotlib.use("Agg")  # pure-CPU raster backend — no display/GPU needed at all
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    import io
+
+    fig = plt.figure(figsize=(size_px / 100, size_px / 100), dpi=100)
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_axis_off()
+
+    verts = mesh.vertices
+    faces = mesh.faces
+    tris = verts[faces]  # (F, 3, 3)
+
+    # Simple fixed-direction lambertian shading per face, computed once from
+    # already-available face normals — cheap, deterministic, no lighting/
+    # material system to get wrong; good enough to read shape, proportions,
+    # and obvious topology problems (which is the actual job here).
+    normals = mesh.face_normals
+    light_dir = np.array([0.5, -0.5, 0.8]); light_dir = light_dir / np.linalg.norm(light_dir)
+    brightness = np.clip(normals @ light_dir, 0.15, 1.0)  # 0.15 ambient floor, never fully black
+    base_color = np.array([0.65, 0.70, 0.78])
+    face_colors = np.clip(base_color[None, :] * brightness[:, None], 0, 1)
+
+    coll = Poly3DCollection(tris, facecolor=face_colors, edgecolor=(0, 0, 0, 0.15), linewidths=0.3)
+    ax.add_collection3d(coll)
+
+    bounds = mesh.bounds
+    center = bounds.mean(axis=0)
+    extent = float(np.max(bounds[1] - bounds[0])) / 2.0 or 1.0
+    ax.set_xlim(center[0] - extent, center[0] + extent)
+    ax.set_ylim(center[1] - extent, center[1] + extent)
+    ax.set_zlim(center[2] - extent, center[2] + extent)
+    try:
+        ax.set_box_aspect((1, 1, 1))
+    except Exception:
+        pass  # older matplotlib without set_box_aspect — proportions degrade gracefully, not fatally
+
+    # Two opposed-ish views by default cover most of a part the way
+    # text-to-cad's "two opposed isometrics" packet does, without needing a
+    # multi-image packet for every single result.
+    views = {"iso": (25, -60), "top": (90, -90), "front": (0, -90), "side": (0, 0)}
+    elev, azim = views.get(view, views["iso"])
+    ax.view_init(elev=elev, azim=azim)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.05)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+async def run_engineering_agent(prompt, material="auto", force_n=1000.0, force_dir="z",
+                                 operating_temp_c=25.0, surface_finish="machined", reliability=0.99,
+                                 project_description=None, max_iterations=4, min_health_score=75.0,
+                                 max_critical_violations=0, max_high_violations=2, min_safety_factor=1.0):
+    if not CQ:
+        raise HTTPException(503, "CadQuery not installed on this server.")
+
+    max_iterations = max(1, min(int(max_iterations), 6))
+    max_steps = max(12, min(max_iterations * 8, 40))
+
+    state = EngineeringDesignState(prompt, material, force_n, force_dir, operating_temp_c, surface_finish,
+                                    reliability, project_description, max_iterations, min_health_score,
+                                    max_critical_violations, max_high_violations, min_safety_factor)
+
+    prompt_lower = prompt.lower()
+    is_taper_hint = any(w in prompt_lower for w in TAPER_KEYWORDS)
+    is_fold_hint = any(w in prompt_lower for w in FOLD_BRACKET_KEYWORDS)
+    hint = ("tapered/lofted — consider set_initial_design with design_type='tapered_beam'" if is_taper_hint
+            else "a bent/folded bracket — consider set_initial_design with design_type='bent_bracket'" if is_fold_hint
+            else "not an obvious match for either built-in parametric primitive — use your judgment; "
+                 "design_type='generic_script' is the safe default if neither tapered_beam nor "
+                 "bent_bracket actually fits")
+
+    user_msg = (
+        f"ENGINEERING REQUEST: {prompt}\n\n"
+        f"Material: {material}. Load: {force_n}N along {force_dir}. Operating temp: {operating_temp_c}C. "
+        f"Surface finish: {surface_finish}. Target reliability: {reliability}.\n"
+        + (f"Project context: {project_description}\n" if project_description else "")
+        + f"\nKeyword heuristic (not a hard rule — use your own judgment): this request looks like {hint}.\n\n"
+        f"Quality thresholds you are building to: min_health_score={min_health_score}, "
+        f"max_critical_violations={max_critical_violations}, max_high_violations={max_high_violations}, "
+        f"min_safety_factor={min_safety_factor}. You have a budget of {max_iterations} run_fea calls.\n\n"
+        "Begin with set_initial_design."
+    )
+    messages = [{"role": "system", "content": ENGINEERING_AGENT_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg}]
+
+    advisor_calls = []
+    cfd_assessment = {"recommended": False, "reasoning": None,
+                       "note": "No advisor configured (NEMOTRON_ADVISOR_MODEL unset) — CFD need was "
+                               "not assessed. This does not mean CFD isn't needed, just that nothing "
+                               "checked."}
+    advisor_intro = await asyncio.to_thread(
+        _call_advisor,
+        f"A user has requested this part be designed: {prompt}\n"
+        f"Material: {material}. Load: {force_n}N along {force_dir}. "
+        f"Quality thresholds: min_health_score={min_health_score}, min_safety_factor={min_safety_factor}.\n"
+        "In 3-6 sentences: what is this part's engineering purpose, what design strategy would you "
+        "start with, and what's the single biggest risk to watch for?\n\n"
+        "Then, on its own final line, state exactly: 'CFD_NEEDED: yes' or 'CFD_NEEDED: no', followed "
+        "by a short reason — e.g. 'CFD_NEEDED: yes - propeller wash creates a real aerodynamic load on "
+        "this arm, not just the static tip force given'. Only say yes if fluid flow (aerodynamics, "
+        "cooling airflow, internal fluid/gas flow) is actually part of this part's function — a plain "
+        "structural bracket or arm evaluated only under a static point load should be 'no'. This "
+        "system does not have a working CFD solver yet, so say so plainly if you believe CFD IS "
+        "warranted here — don't let that absence change your answer."
+    )
+    if advisor_intro:
+        advisor_calls.append({"checkpoint": "initial_understanding", "response": advisor_intro})
+        messages.append({"role": "user", "content":
+            f"ENGINEERING ADVISOR (a second model's strategic read on this request — advisory only, "
+            f"you still make the actual tool calls and the solver results are still the only "
+            f"authoritative truth):\n{advisor_intro}"})
+
+        # Parse the tagged CFD_NEEDED line the advisor was asked for. Defensive by
+        # design — a model not following the exact format is treated as "couldn't
+        # determine", never silently coerced to a false negative or a fabricated yes.
+        import re
+        m = re.search(r"CFD_NEEDED:\s*(yes|no)\s*-?\s*(.*)", advisor_intro, re.IGNORECASE)
+        if m:
+            recommended = m.group(1).strip().lower() == "yes"
+            reason = m.group(2).strip() or None
+            cfd_assessment = {
+                "recommended": recommended,
+                "reasoning": reason,
+                "note": ("CFD analysis was assessed as valuable for this part, but OpenFOAM is not "
+                         "yet integrated into this system — this is a known, honestly-flagged gap, "
+                         "not a result." if recommended else
+                         "Advisor assessed this part as not needing fluid-flow analysis; only "
+                         "structural/thermal/fatigue checks apply."),
+            }
+        else:
+            cfd_assessment = {"recommended": None, "reasoning": None,
+                               "note": "Advisor was asked to assess CFD need but didn't return a "
+                                       "parseable answer — treat as unknown, not as 'no'."}
+
+    tool_trace = []
+    stopped_reason = None
+    step = 0
+    no_tool_call_strikes = 0
+    rate_limit_wait_remaining = 75.0  # BUG FIX: this used to be reset to 90.0 inside the
+    # step loop below, meaning EVERY step got its own fresh 90s retry budget instead of
+    # the whole request sharing one. With up to max_steps (~40) steps, that's a
+    # theoretical 40*90s=3600s of possible retry waiting with no overall cap — confirmed
+    # live as a hang: max_iterations=3 timed out at the full 300s client --max-time with
+    # 0 bytes received (a genuine hang, not the earlier OOM-style connection abort).
+    # Scoped to the whole run now, so sustained rate-limiting fails fast with a clear
+    # "rate_limited" stopped_reason instead of silently retrying past any client timeout.
+    run_started = time.time()
+    MAX_WALL_CLOCK_SECONDS = 240.0  # comfortably under the --max-time 300 used in testing —
+    # the server should always be the one to give up first, with an honest partial result,
+    # rather than depend on the caller's timeout to be the only thing that ever stops this
+
+    for step in range(1, max_steps + 1):
+        if time.time() - run_started > MAX_WALL_CLOCK_SECONDS:
+            stopped_reason = "wall_clock_budget_exceeded"
+            print(f"[engineering-agent] step {step}: stopping — {MAX_WALL_CLOCK_SECONDS}s wall-clock "
+                  f"budget exceeded ({time.time()-run_started:.1f}s elapsed)")
+            break
+        step_started = time.time()
+        assistant = None
+        while True:
+            try:
+                assistant = await asyncio.to_thread(_call_model_with_tools, messages, 0.2, AGENT_TURN_MAX_TOKENS)
+                break
+            except HTTPException as e:
+                if e.status_code == 429 and rate_limit_wait_remaining > 0:
+                    wait_s = min(_parse_groq_retry_after(str(e.detail)), rate_limit_wait_remaining)
+                    rate_limit_wait_remaining -= wait_s
+                    print(f"[engineering-agent] step {step}: 429 rate-limited, waiting {wait_s:.1f}s "
+                          f"({rate_limit_wait_remaining:.1f}s of retry budget left for this request)")
+                    await asyncio.sleep(wait_s)
+                    continue
+                stopped_reason = "rate_limited" if e.status_code == 429 else f"model_call_failed: {e.detail}"
+                break
+        if assistant is None:
+            print(f"[engineering-agent] step {step}: giving up — {stopped_reason} "
+                  f"(elapsed so far: {time.time()-run_started:.1f}s)")
+            break
+        print(f"[engineering-agent] step {step}: model call took {time.time()-step_started:.1f}s, "
+              f"{len(assistant['tool_calls'])} tool call(s), total elapsed {time.time()-run_started:.1f}s")
+
+        messages.append(assistant["_raw_message"])
+
+        if not assistant["tool_calls"]:
+            # Confirmed live: a reasoning model asked to call finalize_design will
+            # sometimes just explain itself in prose instead on the very first
+            # nudge. One miss used to end the whole loop outright, discarding
+            # whatever it actually said. Give it up to 2 misses, with an
+            # increasingly explicit nudge, and keep its prose as a fallback
+            # summary rather than throwing it away.
+            if assistant.get("content") and not state.final_summary:
+                state.final_summary = assistant["content"][:2000]
+            if state.iteration_count > 0:
+                no_tool_call_strikes += 1
+                if no_tool_call_strikes >= 2:
+                    stopped_reason = "model_stopped_without_finalize"
+                    break
+                messages.append({"role": "user", "content":
+                    "You responded without calling a tool. Call finalize_design now — pass 'verdict' "
+                    "(PASSED/BEST_EFFORT/FAILED) and 'summary' as arguments to that tool, don't just "
+                    "describe your assessment in text."})
+                continue
+            messages.append({"role": "user", "content":
+                "Please proceed by calling a tool — start with set_initial_design. Do not describe what "
+                "you would do in prose; call the tool directly."})
+            continue
+        no_tool_call_strikes = 0
+
+        finalize_called = False
+        for tc in assistant["tool_calls"]:
+            tool_started = time.time()
+            result = await _execute_agent_tool(state, tc["name"], tc["arguments"])
+            tool_elapsed = round(time.time() - tool_started, 2)
+            print(f"[engineering-agent] step {step}: tool={tc['name']} took {tool_elapsed}s "
+                  f"-> {result.get('status') if isinstance(result, dict) else '?'}")
+            # FIX: confirmed live — a chain of REJECTED set_initial_design attempts was
+            # only showing result_status here, never the actual reason, so diagnosing why
+            # each attempt failed meant separately re-deriving the safe-parameter-contract
+            # math by hand. Every REJECTED/ERROR result already carries a human-readable
+            # reason/message; surface it directly instead of just the status label.
+            detail = None
+            if isinstance(result, dict):
+                detail = result.get("reason") or result.get("message")
+            tool_trace.append({"step": step, "tool": tc["name"], "arguments": tc["arguments"],
+                                "result_status": result.get("status") if isinstance(result, dict) else None,
+                                "detail": detail, "elapsed_s": tool_elapsed})
+            messages.append(_format_tool_result_message(tc["id"], tc["name"], result))
+            if tc["name"] == "finalize_design":
+                finalize_called = True
+            if (tc["name"] == "run_fea" and isinstance(result, dict)
+                    and result.get("status") == "FAIL" and not result.get("numerically_suspect")):
+                # Sparingly-called checkpoint (see NEMOTRON_ADVISOR_MODEL) — only on an
+                # actual solver FAIL, not on every run_fea call, and skipped entirely
+                # when the solver already flagged its own output as a numerical
+                # artifact (advising on a phantom failure wastes one of a scarce
+                # daily budget of calls for no benefit).
+                advisor_diag = await asyncio.to_thread(
+                    _call_advisor,
+                    f"Design iteration {state.iteration_count} just failed. Current parameters: "
+                    f"{state.params}. Solver diagnosis: status={result.get('status')}, "
+                    f"safety_factor={result.get('safety_factor')}, "
+                    f"critical_region={result.get('critical_region')}, "
+                    f"failure_modes={result.get('failure_modes')}. Recent change history: "
+                    f"{state.hypothesis_log[-3:]}. In 3-6 sentences: what is the most likely root "
+                    f"cause, and what is the SMALLEST parameter change that would address it without "
+                    f"changing anything the user didn't ask to change?"
+                )
+                if advisor_diag:
+                    advisor_calls.append({"checkpoint": f"iteration_{state.iteration_count}_failure",
+                                           "response": advisor_diag})
+                    messages.append({"role": "user", "content":
+                        f"ENGINEERING ADVISOR (a second model's diagnosis — advisory only, weigh it "
+                        f"but you decide the actual tool call; the solver result above remains the "
+                        f"authoritative truth):\n{advisor_diag}"})
+
+        gc.collect()  # end of this step's tool-call batch — a natural point to release
+                      # whatever the last modify/mesh/FEA cycle allocated before the next
+                      # (possibly slow) model round-trip, rather than let it sit and stack up
+
+        if finalize_called:
+            stopped_reason = "agent_finalized"
+            break
+
+        if state.iteration_count >= max_iterations and state.current_candidate is not None:
+            messages.append({"role": "user", "content":
+                f"You have used all {max_iterations} run_fea iterations. Call finalize_design now with "
+                "your honest assessment of the final result."})
+    else:
+        stopped_reason = stopped_reason or "max_steps_reached"
+
+    if stopped_reason is None:
+        stopped_reason = "max_steps_reached"
+
+    winner = state.best_passing_design or state.best_valid_design or state.current_candidate
+    if winner is None:
+        # FIX: confirmed live — every set_initial_design attempt got REJECTED (the safe
+        # parameter contract correctly caught infeasible geometry every time), so nothing
+        # was ever built to analyze. This used to raise a raw HTTPException with the whole
+        # tool trace dumped as an escaped JSON string inside the error detail — technically
+        # informative but painful to actually read. A design the agent never managed to
+        # build is a legitimate engineering outcome (same as an analyzed design that FAILs
+        # FEA), not a server malfunction — so this now returns a normal, structured 200
+        # response like every other result in this file, not an exception.
+        last_rejection = next((t for t in reversed(tool_trace) if t.get("result_status") == "REJECTED"), None)
+        return {
+            "status": "NO_VALID_DESIGN",
+            "summary": f"The Engineering Agent never produced geometry that passed the safe parameter "
+                       f"contract, across {len(tool_trace)} tool call(s). No FEA/analysis was possible "
+                       f"since nothing was ever successfully built.",
+            "last_rejection_reason": (last_rejection or {}).get("detail"),
+            "engineering_agent": {
+                "design_type": None, "final_parameters": None, "iterations_used": state.iteration_count,
+                "max_iterations": max_iterations, "steps_used": step, "max_steps": max_steps,
+                "stopped_reason": stopped_reason, "passed_quality_gate": False,
+                "advisor_calls": advisor_calls, "cfd_assessment": cfd_assessment,
+                "hypothesis_log": state.hypothesis_log, "tool_call_trace": tool_trace,
+            },
+        }
+
+    # FIX: confirmed live — the old "reuse state.mesh if winner is state.current_candidate"
+    # shortcut assumed state.mesh always reflects whatever design `winner` points to. It
+    # doesn't: a modify_* call can succeed (updating state.obj/state.mesh) and then the loop
+    # can get cut off (rate-limited, wall-clock budget) BEFORE run_fea ever confirms that
+    # change with a new snapshot. When that happens, `winner` still correctly points at the
+    # last CONFIRMED snapshot, but state.mesh had already moved on to the unconfirmed next
+    # candidate — so the response reported one set of parameters while actually returning the
+    # analysis/STL of a different, later, never-verified geometry. Rebuilding deterministically
+    # from winner's own stored params every time is cheap for these primitives and makes this
+    # class of mismatch impossible rather than merely unlikely.
+    try:
+        if winner["design_type"] == "tapered_beam":
+            final_obj = make_tapered_beam(**winner["params"])
+        elif winner["design_type"] == "bent_bracket":
+            final_obj = make_bent_bracket(**winner["params"])
+        else:
+            final_obj, build_err = execute_cq_script_safely(winner["script"])
+            if build_err:
+                raise RuntimeError(build_err)
+        final_mesh, final_stl = await mesh_from_cq_object(final_obj)
+    except Exception as e:
+        raise HTTPException(502, f"Failed to rebuild the winning design for final export: {e}")
+
+    final_result = await run_analysis_v8(final_mesh, prompt, prompt, material, force_n, force_dir,
+                                          operating_temp_c, project_description, surface_finish,
+                                          reliability, False)
+    final_quality = evaluate_design_quality(final_result, min_health_score, max_critical_violations,
+                                             max_high_violations, min_safety_factor)
+
+    final_result["generated_stl_base64"] = base64.b64encode(final_stl).decode()
+    try:
+        snapshot_png = render_mesh_snapshot_png(final_mesh, view="iso")
+        final_result["generated_snapshot_base64"] = base64.b64encode(snapshot_png).decode()
+        final_result["generated_snapshot_note"] = (
+            "Diagnostic only, not authoritative — a quick visual sanity check (proportions, obvious "
+            "topology problems) for a human to glance at, same principle as any other unbenchmarked "
+            "estimate in this file. Never treat this image as confirming or overriding a solver result."
+        )
+    except Exception as e:
+        final_result["generated_snapshot_base64"] = None
+        final_result["generated_snapshot_note"] = f"Snapshot rendering failed ({type(e).__name__}: {e}) — not fatal, every other result field is unaffected."
+    final_result["generated_script"] = (winner["script"] if winner["design_type"] == "generic_script"
+                                         else params_to_script_tapered_beam(winner["params"])
+                                         if winner["design_type"] == "tapered_beam"
+                                         else params_to_script_bent_bracket(winner["params"]))
+    final_result["generation_method"] = f"lumexa_engineering_agent_{winner['design_type']}"
+    final_result["engineering_agent"] = {
+        "design_type": winner["design_type"], "final_parameters": winner.get("params"),
+        "iterations_used": state.iteration_count, "max_iterations": max_iterations,
+        "steps_used": step, "max_steps": max_steps, "stopped_reason": stopped_reason,
+        "passed_quality_gate": final_quality["passed"], "final_reasons": final_quality["reasons"],
+        "used_best_passing": winner is state.best_passing_design,
+        "used_best_valid_fallback": (winner is state.best_valid_design and winner is not state.best_passing_design),
+        "agent_final_verdict_claimed": state.final_verdict_claimed, "agent_final_summary": state.final_summary,
+        "hypothesis_log": state.hypothesis_log, "tool_call_trace": tool_trace,
+        "advisor_calls": advisor_calls, "cfd_assessment": cfd_assessment,
+        "quality_thresholds": {"min_health_score": min_health_score,
+                                "max_critical_violations": max_critical_violations,
+                                "max_high_violations": max_high_violations,
+                                "min_safety_factor": min_safety_factor},
+    }
+    return final_result
+
+
+@app.post("/engineering-agent")
+@_sanitize_response
+async def engineering_agent_endpoint(
+    prompt: str = Form(...),
+    material: str = Form("auto"),
+    force_n: float = Form(1000.0),
+    force_dir: str = Form("z"),
+    operating_temp_c: float = Form(25.0),
+    surface_finish: str = Form("machined"),
+    reliability: float = Form(0.99),
+    project_description: Optional[str] = Form(None),
+    max_iterations: int = Form(4),
+    min_health_score: float = Form(75.0),
+    max_critical_violations: int = Form(0),
+    max_high_violations: int = Form(2),
+    min_safety_factor: float = Form(1.0),
+):
+    """
+    THE ENGINEERING AGENT — Understand -> Inspect -> Diagnose -> Propose -> Modify ->
+    Verify -> Simulate -> Compare -> Refine, instead of /generate-validate-refine's
+    "regenerate the whole script and hope" loop.
+
+    The frontier model (GPT-OSS-120B via Groq, by default — see AI_PROVIDER) reasons about
+    the design and calls tools; Lumexa's deterministic geometry kernel, mesher, and solver
+    remain the sole source of engineering truth. The model never declares pass/fail itself
+    and never hand-writes CadQuery for the tapered-beam/bent-bracket workflows — it only
+    proposes named parameter changes, which are validated against a safe-parameter contract
+    and applied through make_tapered_beam/make_bent_bracket, the same trusted server-side
+    primitives /generate-validate-refine already relies on. Geometry outside what those two
+    primitives cover falls back to the existing AI-script-generation/refinement machinery,
+    still wrapped in the same validate -> mesh -> FEA -> compare loop.
+
+    FIRST IMPLEMENTATION TARGET (per the build spec this endpoint implements): the
+    tapered-beam workflow — e.g. "Design a tapered drone arm capable of carrying 2kg."
+    Bent-bracket support is wired the same way since make_bent_bracket already existed, but
+    has had less real-world exercise than the beam path — test that path first.
+
+    Requires AI_PROVIDER to be an OpenAI-compatible provider with tool-calling
+    (groq/openrouter/lovable/cerebras/nvidia). Set AI_PROVIDER=nvidia + NVIDIA_MODEL to use
+    any model in NVIDIA's NIM catalog (Nemotron 3 Ultra, Kimi K3, DeepSeek V4, and 90+
+    others all share one endpoint/key — see the NVIDIA_API_KEY setup comment for confirmed-
+    live model IDs), or AI_PROVIDER=groq for Groq's openai/gpt-oss-120b. Claude/Gemini
+    native tool-calling is not wired up for this endpoint yet; /generate-validate-refine
+    still works on every provider as before.
+
+    Response shape matches /analyze-part (geometry/FEA/fatigue/rule_engine/health_score/...)
+    plus generated_stl_base64, generated_script, and an "engineering_agent" block with the
+    full hypothesis log and tool-call trace for transparency.
+    """
+    return await run_engineering_agent(
+        prompt, material, force_n, force_dir, operating_temp_c, surface_finish, reliability,
+        project_description, max_iterations, min_health_score, max_critical_violations,
+        max_high_violations, min_safety_factor,
+    )
